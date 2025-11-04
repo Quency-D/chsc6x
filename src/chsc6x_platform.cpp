@@ -141,7 +141,7 @@ int chsc6x_platform::semi_touch_get_int(void)
 {
     if(_int_pin != -1) {
         pinMode(_int_pin, INPUT_PULLUP);
-        attachInterrupt(digitalPinToInterrupt(_int_pin), blink, CHANGE);
+        attachInterrupt(digitalPinToInterrupt(_int_pin), blink, RISING);
     }
     return _int_pin;
 }
