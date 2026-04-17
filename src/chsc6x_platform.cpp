@@ -141,7 +141,10 @@ int chsc6x_platform::semi_touch_get_int(void)
 {
     if(_int_pin != -1) {
         pinMode(_int_pin, INPUT_PULLUP);
-        attachInterrupt(digitalPinToInterrupt(_int_pin), blink, RISING);
+        int irq = digitalPinToInterrupt(_int_pin);
+        if (irq >= 0) {
+            attachInterrupt(irq, blink, RISING);
+        }
     }
     return _int_pin;
 }
@@ -158,12 +161,18 @@ int chsc6x_platform::semi_touch_get_rst(void)
 
 void chsc6x_platform::semi_rst_pin_low(int pin)
 {
+    if(pin == -1) {
+        return;
+    }
     pinMode(pin,OUTPUT);
     digitalWrite(pin, LOW);
 }
 
 void chsc6x_platform::semi_rst_pin_high(int pin)
 {
+    if(pin == -1) {
+        return;
+    }
     pinMode(pin,OUTPUT);
     digitalWrite(pin, HIGH);
 }

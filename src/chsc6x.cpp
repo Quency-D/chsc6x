@@ -136,7 +136,9 @@ void chsc6x::chsc6x_init(void)
     memset(&st_dev, 0, sizeof(st_dev));
     st_dev.int_pin = semi_touch_get_int();
     st_dev.rst_pin = semi_touch_get_rst();
-    semi_rst_pin_high(st_dev.rst_pin);
+    if(st_dev.rst_pin != -1) {
+        semi_rst_pin_high(st_dev.rst_pin);
+    }
     semi_touch_i2c_init();
     chsc6x_msleep(60);
     chsc6x_tp_reset(HW_CMD_RESET);
