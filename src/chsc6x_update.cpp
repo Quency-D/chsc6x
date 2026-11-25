@@ -40,13 +40,15 @@ constexpr uint32_t chip3536 = 0x35368008;
 constexpr uint32_t runningTag = 0x544C4E4B;
 constexpr uint32_t burnHelper = 0x6D6F8008;
 constexpr uint32_t cfgIdentityMask = 0x03FFFFFF;
+constexpr uint32_t bootIdentityMask = 0x00FFFFFF;
 
 // This vendor package contains one match entry, one cfg and one boot image.
 struct UpdateImage {
     const uint8_t *cfg;
     const uint8_t *boot;
     uint16_t boot_size;
-    uint32_t identity;
+    uint32_t cfg_identity;
+    uint32_t boot_match;
     chsc6x_versions versions;
 };
 
@@ -64,11 +66,12 @@ bool open_image(UpdateImage &image)
     image.cfg = p + cfgOffset;
     image.boot = p + bootOffset;
     image.boot_size = size - bootOffset;
-    image.identity = le32(image.cfg) & cfgIdentityMask;
+    image.cfg_identity = le32(image.cfg) & cfgIdentityMask;
+    image.boot_match = le32(p + 24);
     image.versions.cfg = image.cfg[3] >> 2;
     image.versions.boot = le16(image.boot + 4);
     const size_t body = image.boot_size - 4;
-    return le32(p + 24) == (image.identity & 0x00FFFFFF) &&
+    return image.boot_match == (image.cfg_identity & bootIdentityMask) &&
            image.cfg[106] == (CHSC6X_I2C_ID << 1) && sum16(image.cfg, sizeof(chsc6x_cfg::bytes)) == 0 &&
            le32(image.boot) == chip3536 && le32(image.boot + 8) == runningTag &&
            image.versions.boot != 0 && le16(image.boot + 6) == body &&
@@ -428,14 +431,16 @@ void chsc6x::update_if_needed(uint32_t identity, bool hasReset)
         restore_touch_mode(true);
         return;
     }
-    if (identity != image.identity) {
+    const bool cfgMatches = identity == image.cfg_identity;
+    const bool bootMatches = (identity & bootIdentityMask) == image.boot_match;
+    if (!cfgMatches && !bootMatches) {
         init_result.status = chsc6x_init_status::incompatible;
         init_result.stage = "panel_identity";
         restore_touch_mode(true);
         return;
     }
-    const bool writeCfg = image.versions.cfg > init_result.before.cfg;
-    const bool writeBoot = image.versions.boot > init_result.before.boot;
+    const bool writeCfg = cfgMatches && image.versions.cfg > init_result.before.cfg;
+    const bool writeBoot = bootMatches && image.versions.boot > init_result.before.boot;
     if (!writeCfg && !writeBoot) {
         init_result.status = chsc6x_init_status::current;
         init_result.stage = "current";
@@ -471,13 +476,14 @@ void chsc6x::update_if_needed(uint32_t identity, bool hasReset)
         return;
     }
     chsc6x_tp_reset(HW_CMD_RESET);
+    uint32_t identityAfterReset = 0;
     const bool normal = set_cfg_direct_mode(true) == OS_OK &&
-        read_running_versions(init_result.after, identity) == probe_state::running;
+        read_running_versions(init_result.after, identityAfterReset) == probe_state::running;
     init_result.after_valid = normal;
     if (ok) {
         const uint8_t expectedCfg = writeCfg ? image.versions.cfg : init_result.before.cfg;
         const uint16_t expectedBoot = writeBoot ? image.versions.boot : init_result.before.boot;
-        if (normal && identity == image.identity && init_result.after.cfg == expectedCfg &&
+        if (normal && identityAfterReset == identity && init_result.after.cfg == expectedCfg &&
             init_result.after.boot == expectedBoot) {
             init_result.status = chsc6x_init_status::updated;
             init_result.stage = "verified";
