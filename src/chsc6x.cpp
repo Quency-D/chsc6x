@@ -1,10 +1,74 @@
 #include "chsc6x.h"
 
+int chsc6x::get_cfg_direct_mode(bool &direct)
+{
+    uint8_t mode[3];
+    if (chsc6x_read_bytes_u16addr(_i2c_addr, 0x0001, mode, sizeof(mode)) != OS_OK) {
+        return -OS_ERROR;
+    }
+    direct = mode[0] == (_i2c_addr << 1) && mode[2] == 0x01;
+    return OS_OK;
+}
+
+int chsc6x::set_cfg_direct_mode(bool direct)
+{
+    uint8_t enter[] = {0x28, 0x35, 0xC1, 0x00, 0x35, 0xAE};
+    uint8_t leave = 0x05;
+    for (int attempt = 0; attempt <= TP_RETRY_CNT2; ++attempt) {
+        bool isDirect = false;
+        const bool readable = get_cfg_direct_mode(isDirect) == OS_OK;
+        if (readable && isDirect == direct) {
+            return OS_OK;
+        }
+        if (attempt == TP_RETRY_CNT2) {
+            break;
+        }
+        // Confirm the transition by reading the signature again after the delay.
+        if (direct && readable) {
+            chsc6x_write_bytes_u16addr(_i2c_addr, 0x42BD, enter, sizeof(enter));
+        } else if (!direct) {
+            chsc6x_write_bytes_u16addr(_i2c_addr, 0x0003, &leave, 1);
+        }
+        chsc6x_msleep(30);
+    }
+    return -OS_ERROR;
+}
+
+int chsc6x::chsc6x_read_cfg(chsc6x_cfg &cfg)
+{
+    if (init_result.needs_power_cycle) {
+        return CHSC6X_CFG_ENTER_FAILED;
+    }
+    chsc6x_cfg snapshot;
+    int status = CHSC6X_CFG_ENTER_FAILED;
+    if (set_cfg_direct_mode(true) == OS_OK) {
+        for (int attempt = 0; attempt < TP_RETRY_CNT2; ++attempt) {
+            if (attempt > 0) {
+                chsc6x_msleep(20);
+            }
+            status = read_running_cfg(snapshot);
+            if (status == OS_OK) {
+                break;
+            }
+        }
+    }
+    if (set_cfg_direct_mode(false) != OS_OK) {
+        return CHSC6X_CFG_RESTORE_FAILED;
+    }
+    if (status == OS_OK) {
+        cfg = snapshot;
+    }
+    return status;
+}
+
 
 
 
 int chsc6x::chsc6x_read_touch_info(uint16_t *touchX, uint16_t *touchY)
 {
+    if (init_result.needs_power_cycle) {
+        return -OS_ERROR;
+    }
     int ret;
     uint8_t i, point_num;
     uint8_t rd_len = 16;
@@ -128,18 +192,4 @@ void chsc6x::chsc6x_suspend(void)    //Call when the display is off
     }else{
         chsc6x_err("chsc6x: enter suspend failed! \r\n");
     }
-}
-
-void chsc6x::chsc6x_init(void)
-{
-    struct sm_touch_dev st_dev;
-    memset(&st_dev, 0, sizeof(st_dev));
-    st_dev.int_pin = semi_touch_get_int();
-    st_dev.rst_pin = semi_touch_get_rst();
-    if(st_dev.rst_pin != -1) {
-        semi_rst_pin_high(st_dev.rst_pin);
-    }
-    semi_touch_i2c_init();
-    chsc6x_msleep(60);
-    chsc6x_tp_reset(HW_CMD_RESET);
 }

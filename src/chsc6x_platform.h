@@ -49,6 +49,7 @@ typedef enum
 class chsc6x_platform
 {
 private:
+    int readRegister(uint8_t id, uint16_t reg, bool wideAddress, uint8_t *data, uint16_t length);
     TwoWire *_wire;
     int _sda_pin;
     int _scl_pin;
@@ -68,7 +69,7 @@ public:
 
 /* fail : <0 */
 int i2cRead(uint8_t i2c_adr, uint16_t reg_adr, uint8_t *rxbuf, uint16_t lenth);
-int i2cSend(uint8_t i2c_adr, uint16_t reg_adr, uint8_t *txbuf, uint16_t lenth);
+int i2cSend(uint8_t i2c_adr, uint16_t reg_adr, const uint8_t *txbuf, uint16_t lenth);
 
 /* RETURN:0->pass else->fail */
 int chsc6x_read_bytes_u8addr(uint8_t id, uint8_t adr, uint8_t *rxbuf, uint16_t lenth);
@@ -76,7 +77,7 @@ int chsc6x_read_bytes_u8addr(uint8_t id, uint8_t adr, uint8_t *rxbuf, uint16_t l
 int chsc6x_read_bytes_u16addr(uint8_t id, uint16_t adr, uint8_t *rxbuf, uint16_t lenth);
 
 /* RETURN:0->pass else->fail */
-int chsc6x_write_bytes_u16addr(uint8_t id, uint16_t addr, uint8_t *txbuf, uint16_t lenth);
+int chsc6x_write_bytes_u16addr(uint8_t id, uint16_t addr, const uint8_t *txbuf, uint16_t lenth);
 void chsc6x_tp_reset_delay(chsc6x_reset_e type);
 
 void chsc6x_msleep(int ms);

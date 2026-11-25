@@ -2,52 +2,41 @@
 
 int chsc6x_platform::semi_touch_i2c_init(void)
 {
-    //power on
-    if((_sda_pin != -1) && (_scl_pin != -1))
-    {
-        _wire->begin(_sda_pin,_scl_pin,400000);
+    if (_sda_pin != -1 && _scl_pin != -1) {
+        return _wire->begin(_sda_pin, _scl_pin, 400000) ? OS_OK : -OS_ERROR;
     }
-    else
-    {
-        _wire->begin();
-    }
-    // _wire->begin(TOUCH_SDA_PIN,TOUCH_SCL_PIN,400000);
-    return 0;
+    return _wire->begin() ? OS_OK : -OS_ERROR;
 }
 
 int chsc6x_platform::i2cRead(uint8_t i2c_adr, uint16_t reg_adr, uint8_t *rxbuf, uint16_t lenth)
 {
-    uint8_t buf[2];
-    uint8_t reg_adr_len,num = 0;
-    if(rxbuf == NULL || lenth == 0)
-    {
-        return -OS_ERROR;
-    }
-    if(reg_adr > 0xFF )
-    {
-        buf[0] = (uint8_t) (reg_adr >> 8);
-        buf[1] = (uint8_t) reg_adr ;
-        reg_adr_len = 2;
-    }
-    else
-    {
-        buf[0] = (uint8_t) reg_adr ;
-        reg_adr_len = 1;
-    }
-
-    _wire->beginTransmission(i2c_adr); // start transmission to device 
-    _wire->write(buf,reg_adr_len); // sends register address to read from
-    _wire->endTransmission(0); // end transmission
-   
-    _wire->requestFrom(i2c_adr,lenth,true);// send data n-bytes read
-    while(_wire->available() && (num < lenth))
-    {
-		  rxbuf[num++] = _wire->read(); // receive DATA
-    }
-    return num;
+    return readRegister(i2c_adr, reg_adr, reg_adr > 0xFF, rxbuf, lenth);
 }
 
-int chsc6x_platform::i2cSend(uint8_t i2c_adr, uint16_t reg_adr, uint8_t *txbuf, uint16_t lenth)
+int chsc6x_platform::readRegister(uint8_t id, uint16_t reg, bool wideAddress, uint8_t *data, uint16_t length)
+{
+    if (data == nullptr || length == 0) {
+        return -OS_ERROR;
+    }
+    const uint8_t address[] = {static_cast<uint8_t>(reg >> 8), static_cast<uint8_t>(reg)};
+    const size_t addressLength = wideAddress ? 2 : 1;
+    _wire->beginTransmission(id);
+    if (_wire->write(address + (2 - addressLength), addressLength) != addressLength) {
+        _wire->endTransmission();
+        return -OS_ERROR;
+    }
+    if (_wire->endTransmission(false) != 0) {
+        return -OS_ERROR;
+    }
+    const size_t received = _wire->requestFrom(id, static_cast<size_t>(length), true);
+    uint16_t count = 0;
+    while (count < received && count < length && _wire->available()) {
+        data[count++] = static_cast<uint8_t>(_wire->read());
+    }
+    return count;
+}
+
+int chsc6x_platform::i2cSend(uint8_t i2c_adr, uint16_t reg_adr, const uint8_t *txbuf, uint16_t lenth)
 {
     uint8_t buffer[MAX_IIC_WR_LEN+2] = {0};
     if (NULL==txbuf|| lenth>MAX_IIC_WR_LEN)
@@ -59,8 +48,10 @@ int chsc6x_platform::i2cSend(uint8_t i2c_adr, uint16_t reg_adr, uint8_t *txbuf, 
     memcpy(&buffer[2], txbuf, lenth);
 
     _wire->beginTransmission(i2c_adr);
-    _wire->write(buffer, lenth+2);
-    _wire->endTransmission();		
+    const size_t written = _wire->write(buffer, lenth + 2);
+    if (_wire->endTransmission() != 0 || written != static_cast<size_t>(lenth + 2)) {
+        return -OS_ERROR;
+    }
     return lenth+2;
 }
 
@@ -74,7 +65,7 @@ int chsc6x_platform::chsc6x_read_bytes_u8addr(uint8_t id, uint8_t adr, uint8_t *
     }
 }
 
-int chsc6x_platform::chsc6x_write_bytes_u16addr(uint8_t id, uint16_t adr, uint8_t *txbuf, uint16_t lenth)
+int chsc6x_platform::chsc6x_write_bytes_u16addr(uint8_t id, uint16_t adr, const uint8_t *txbuf, uint16_t lenth)
 {
     int ret = i2cSend(id,adr,txbuf,lenth);
     if(ret == lenth+2) {
@@ -86,7 +77,7 @@ int chsc6x_platform::chsc6x_write_bytes_u16addr(uint8_t id, uint16_t adr, uint8_
 
 int chsc6x_platform::chsc6x_read_bytes_u16addr(uint8_t id, uint16_t adr, uint8_t *rxbuf, uint16_t lenth)
 {
-    int ret = i2cRead(id,adr,rxbuf,lenth);
+    int ret = readRegister(id, adr, true, rxbuf, lenth);
     if(ret == lenth) {
         return OS_OK;
     }else{
