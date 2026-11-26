@@ -39,6 +39,7 @@ uint32_t checksum_ex(const uint8_t *data, size_t length)
 constexpr uint32_t chip3536 = 0x35368008;
 constexpr uint32_t runningTag = 0x544C4E4B;
 constexpr uint32_t burnHelper = 0x6D6F8008;
+constexpr char mcuReadWarning[] = "CHSC6X: MCU state unreadable, skipping update\r\n";
 constexpr uint32_t cfgIdentityMask = 0x03FFFFFF;
 constexpr uint32_t bootIdentityMask = 0x00FFFFFF;
 
@@ -306,6 +307,7 @@ chsc6x::probe_state chsc6x::read_running_versions(chsc6x_versions &versions, uin
 {
     uint8_t header[12];
     chsc6x_cfg cfg;
+    probe_state state = probe_state::unreadable;
     for (int attempt = 0; attempt < TP_RETRY_CNT2; ++attempt) {
         if (attempt > 0) {
             chsc6x_msleep(20);
@@ -320,15 +322,19 @@ chsc6x::probe_state chsc6x::read_running_versions(chsc6x_versions &versions, uin
             return probe_state::unsupported;
         }
         const uint16_t boot = le16(header + 4);
-        if (le32(header + 8) != runningTag || boot == 0 || boot == 0xFFFF ||
-            read_running_cfg(cfg) != OS_OK) {
+        if (le32(header + 8) != runningTag || boot == 0 || boot == 0xFFFF) {
+            state = probe_state::unreadable;
+            continue;
+        }
+        if (read_running_cfg(cfg) != OS_OK) {
+            state = probe_state::cfg_unreadable;
             continue;
         }
         versions = {cfg.version(), boot};
         identity = le32(cfg.bytes) & cfgIdentityMask;
         return probe_state::running;
     }
-    return probe_state::unreadable;
+    return state;
 }
 
 void chsc6x::restore_touch_mode(bool usable)
@@ -342,7 +348,7 @@ void chsc6x::restore_touch_mode(bool usable)
     init_result.touch_ready = usable;
 }
 
-bool chsc6x::prepare_controller(bool hasReset, const chsc6x_init_result &previous)
+bool chsc6x::prepare_controller(bool hasReset, const chsc6x_init_result &previous, bool &skipUpdate)
 {
     semi_touch_get_int();
     if (semi_touch_i2c_init() != OS_OK) {
@@ -351,6 +357,7 @@ bool chsc6x::prepare_controller(bool hasReset, const chsc6x_init_result &previou
         }
         return false;
     }
+    init_result.stage = "probe";
     chsc6x_msleep(60);
     if (hasReset) {
         chsc6x_tp_reset(HW_CMD_RESET);
@@ -363,20 +370,36 @@ bool chsc6x::prepare_controller(bool hasReset, const chsc6x_init_result &previou
     const bool modeKnown = get_cfg_direct_mode(direct) == OS_OK;
     if (previous.needs_power_cycle && (!modeKnown || direct)) {
         init_result = previous;
-        Serial.println("CHSC6X: power-cycle the touch controller");
+        chsc6x_info("CHSC6X: power-cycle the touch controller\r\n");
         return false;
     }
     if (!modeKnown) {
+        // Retry only to recover touch. This init must skip programming.
+        skipUpdate = true;
         init_result.stage = "read_mode";
-        return false;
+        if (get_cfg_direct_mode(direct) != OS_OK) {
+            chsc6x_err("CHSC6X: I2C mode unreadable, skipping update\r\n");
+            return false;
+        }
     }
     if (direct) {
         uint8_t control = 0;
-        if (chsc6x_read_bytes_u16addr(_i2c_addr, 0x0602, &control, 1) != OS_OK || control == 0x05) {
+        if (chsc6x_read_bytes_u16addr(_i2c_addr, 0x0602, &control, 1) != OS_OK) {
+            if (!skipUpdate) {
+                init_result.stage = "mcu_state";
+            }
+            skipUpdate = true;
+            if (chsc6x_read_bytes_u16addr(_i2c_addr, 0x0602, &control, 1) != OS_OK) {
+                init_result.stage = "mcu_state";
+                chsc6x_err(mcuReadWarning);
+                return false;
+            }
+        }
+        if (control == 0x05) {
             init_result.status = chsc6x_init_status::power_cycle_required;
             init_result.stage = "mcu_state";
             init_result.needs_power_cycle = true;
-            Serial.println("CHSC6X: power-cycle the touch controller");
+            chsc6x_info("CHSC6X: power-cycle the touch controller\r\n");
             return false;
         }
     }
@@ -390,17 +413,14 @@ void chsc6x::chsc6x_init()
     init_result.status = chsc6x_init_status::error;
     init_result.stage = "i2c_init";
     const bool hasReset = semi_touch_get_rst() >= 0;
-    if (!prepare_controller(hasReset, previous)) {
+    bool skipUpdate = false;
+    if (!prepare_controller(hasReset, previous, skipUpdate)) {
         return;
     }
 
-    init_result.stage = "probe";
-    if (set_cfg_direct_mode(true) != OS_OK) {
-        restore_touch_mode(false);
-        return;
-    }
     uint32_t identity = 0;
-    const probe_state state = read_running_versions(init_result.before, identity);
+    const probe_state state = set_cfg_direct_mode(true) == OS_OK
+        ? read_running_versions(init_result.before, identity) : probe_state::unreadable;
     if (state == probe_state::burn_helper) {
         if (previous.needs_power_cycle) {
             init_result = previous;
@@ -409,18 +429,26 @@ void chsc6x::chsc6x_init()
             init_result.stage = "burn_helper_active";
         }
         init_result.needs_power_cycle = true;
-        Serial.println("CHSC6X: power-cycle the touch controller");
+        chsc6x_info("CHSC6X: power-cycle the touch controller\r\n");
         return;
     }
-    if (state != probe_state::running) {
-        if (state == probe_state::unsupported) {
-            init_result.status = chsc6x_init_status::incompatible;
-        }
-        restore_touch_mode(false);
+    init_result.before_valid = state == probe_state::running;
+    if (init_result.before_valid && !skipUpdate) {
+        update_if_needed(identity, hasReset);
         return;
     }
-    init_result.before_valid = true;
-    update_if_needed(identity, hasReset);
+    if (state == probe_state::unsupported) {
+        init_result.status = chsc6x_init_status::incompatible;
+    }
+    if (skipUpdate) {
+        chsc6x_err("CHSC6X: I2C read failed at %s, skipping update\r\n", init_result.stage);
+    } else if (state == probe_state::cfg_unreadable) {
+        init_result.stage = "read_cfg";
+        chsc6x_err("CHSC6X: cfg unreadable, skipping update\r\n");
+    } else if (state == probe_state::unreadable) {
+        chsc6x_err("CHSC6X: running firmware unreadable, skipping update\r\n");
+    }
+    restore_touch_mode(init_result.before_valid || state == probe_state::cfg_unreadable);
 }
 
 void chsc6x::update_if_needed(uint32_t identity, bool hasReset)
@@ -472,7 +500,7 @@ void chsc6x::update_if_needed(uint32_t identity, bool hasReset)
             init_result.status = chsc6x_init_status::power_cycle_required;
             init_result.stage = "written_verified";
         }
-        Serial.println("CHSC6X: power-cycle the touch controller");
+        chsc6x_info("CHSC6X: power-cycle the touch controller\r\n");
         return;
     }
     chsc6x_tp_reset(HW_CMD_RESET);

@@ -56,9 +56,9 @@ struct chsc6x_init_result {
 class chsc6x :public chsc6x_platform{
 private:
     chsc6x_init_result init_result;
-    enum class probe_state { running, burn_helper, unsupported, unreadable };
+    enum class probe_state { running, cfg_unreadable, burn_helper, unsupported, unreadable };
     probe_state read_running_versions(chsc6x_versions &versions, uint32_t &identity);
-    bool prepare_controller(bool hasReset, const chsc6x_init_result &previous);
+    bool prepare_controller(bool hasReset, const chsc6x_init_result &previous, bool &skipUpdate);
     void update_if_needed(uint32_t identity, bool hasReset);
     void restore_touch_mode(bool usable);
     int get_cfg_direct_mode(bool &direct);
