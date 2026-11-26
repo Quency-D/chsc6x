@@ -1,28 +1,13 @@
-#include "chsc6x.h"
 #include "chsc6x_update.h"
+#include "detail/chsc6x_bytes.h"
 #include <string.h>
 
 namespace {
 
 // Little-endian fields and checksums shared by the image and programming protocol.
-uint16_t le16(const uint8_t *p)
-{
-    return p[0] | (static_cast<uint16_t>(p[1]) << 8);
-}
-
-uint32_t le32(const uint8_t *p)
-{
-    return le16(p) | (static_cast<uint32_t>(le16(p + 2)) << 16);
-}
-
-uint16_t sum16(const uint8_t *data, size_t length)
-{
-    uint16_t sum = 0;
-    for (size_t i = 0; i + 1 < length; i += 2) {
-        sum += le16(data + i);
-    }
-    return sum;
-}
+using chsc6x_bytes::le16;
+using chsc6x_bytes::le32;
+using chsc6x_bytes::sum16;
 
 uint32_t checksum_ex(const uint8_t *data, size_t length)
 {
@@ -38,8 +23,6 @@ uint32_t checksum_ex(const uint8_t *data, size_t length)
 // Identify the panel and validate the packaged CFG and BOOT before programming.
 constexpr uint32_t chip3536 = 0x35368008;
 constexpr uint32_t runningTag = 0x544C4E4B;
-constexpr uint32_t burnHelper = 0x6D6F8008;
-constexpr char mcuReadWarning[] = "CHSC6X: MCU state unreadable, skipping update\r\n";
 constexpr uint32_t cfgIdentityMask = 0x03FFFFFF;
 constexpr uint32_t bootIdentityMask = 0x00FFFFFF;
 
@@ -53,20 +36,21 @@ struct UpdateImage {
     chsc6x_versions versions;
 };
 
-bool open_image(UpdateImage &image)
+bool open_image(const uint8_t *p, size_t length, UpdateImage &image)
 {
-    const uint8_t *p = fw_file_tlsc6x_05_12;
     constexpr size_t cfgOffset = 24 + 4;
     constexpr size_t bootOffset = cfgOffset + sizeof(chsc6x_cfg::bytes);
-    constexpr size_t size = sizeof(fw_file_tlsc6x_05_12);
-    static_assert(size >= bootOffset + 16 && size - bootOffset <= 0x8000, "Invalid CHSC image size");
+    // Header, one match word, one cfg, then a boot with its own header and checksum.
+    if (!p || length < bootOffset + 16 || length - bootOffset > 0x8000) {
+        return false;
+    }
     if (le32(p) != 0x43534843 || le32(p + 8) != 1 || le32(p + 12) != 1 ||
-        le32(p + 16) != sizeof(chsc6x_cfg::bytes) || le32(p + 20) != size - bootOffset) {
+        le32(p + 16) != sizeof(chsc6x_cfg::bytes) || le32(p + 20) != length - bootOffset) {
         return false;
     }
     image.cfg = p + cfgOffset;
     image.boot = p + bootOffset;
-    image.boot_size = size - bootOffset;
+    image.boot_size = static_cast<uint16_t>(length - bootOffset);
     image.cfg_identity = le32(image.cfg) & cfgIdentityMask;
     image.boot_match = le32(p + 24);
     image.versions.cfg = image.cfg[3] >> 2;
@@ -75,7 +59,7 @@ bool open_image(UpdateImage &image)
     return image.boot_match == (image.cfg_identity & bootIdentityMask) &&
            image.cfg[106] == (CHSC6X_I2C_ID << 1) && sum16(image.cfg, sizeof(chsc6x_cfg::bytes)) == 0 &&
            le32(image.boot) == chip3536 && le32(image.boot + 8) == runningTag &&
-           image.versions.boot != 0 && le16(image.boot + 6) == body &&
+           image.versions.boot != 0 && image.versions.boot != 0xFFFF && le16(image.boot + 6) == body &&
            checksum_ex(image.boot, body) == le32(image.boot + body);
 }
 
@@ -88,6 +72,122 @@ constexpr uint16_t block_size = 1024;
 constexpr uint8_t write_command = 0x30;
 constexpr uint8_t read_command = 0x31;
 constexpr uint8_t attempts = 3;
+
+// RAM flash programmer from chsc6xx-mcu-20250222/chsc6x_ramcode.h.
+// Replace this initializer only when updating the corresponding vendor programmer.
+alignas(4) static const unsigned char fw_fcode_burn[] = {
+  0x08,0x80,0x6F,0x6D,0x00,0x00,0xF0,0x06,0x4B,0x4E,0x4C,0x54,0x80,0x01,0x88,0x00,
+  0x34,0x80,0xC0,0x46,0x00,0xA0,0x17,0x09,0x17,0x0A,0x08,0x50,0x04,0xB1,0x91,0x02,
+  0xFB,0xCB,0x0C,0x08,0xC0,0x6B,0x0D,0x08,0x85,0x06,0x0B,0x08,0xC0,0x6B,0x0C,0x08,
+  0x85,0x06,0x0C,0x09,0x40,0xA0,0x08,0x40,0x40,0xA0,0x48,0x40,0x0A,0x09,0x0B,0x0A,
+  0x0B,0x0B,0x08,0x58,0x10,0x50,0x04,0xB1,0x04,0xB2,0x9A,0x02,0xF9,0xCB,0x00,0x90,
+  0xF1,0x9A,0xC0,0x46,0x12,0x00,0x00,0x00,0x13,0x00,0x00,0x00,0xF0,0x9D,0x80,0x00,
+  0xF0,0x9C,0x80,0x00,0x0C,0x06,0x80,0x00,0xF0,0x06,0x00,0x00,0x04,0x8D,0x80,0x00,
+  0x04,0x8D,0x80,0x00,0x04,0x8D,0x80,0x00,0x00,0xA0,0x80,0x00,0x30,0x00,0x00,0x00,
+  0x45,0x03,0x00,0x00,0x31,0x00,0x00,0x00,0x15,0x03,0x00,0x00,0x33,0x00,0x00,0x00,
+  0xD1,0x04,0x00,0x00,0x32,0x00,0x00,0x00,0xD1,0x02,0x00,0x00,0x30,0x65,0x07,0x0C,
+  0x01,0xA3,0x23,0x40,0x05,0xF6,0x1C,0xA0,0x00,0x90,0x9E,0x98,0x00,0xA3,0x23,0x40,
+  0x03,0x0B,0x2D,0xFE,0x1D,0x40,0x00,0x90,0xC7,0x98,0x30,0x6D,0x0D,0x00,0x80,0x00,
+  0x0C,0x00,0x80,0x00,0xF0,0x65,0xFA,0xA0,0xC0,0xF0,0x00,0x90,0x8D,0x98,0x05,0xA0,
+  0xFF,0x97,0xE4,0x9F,0x0A,0x0C,0x0B,0x0D,0x00,0xA6,0x01,0xA7,0x05,0x80,0xC8,0xA0,
+  0x01,0xBC,0x00,0x90,0x81,0x98,0x00,0xAC,0x05,0xC0,0x2E,0x40,0x00,0x90,0xAC,0x98,
+  0x2B,0x48,0x1F,0x02,0xF3,0xC1,0x04,0x0B,0x01,0xA2,0x1A,0x40,0xF0,0x6D,0xC0,0x46,
+  0x80,0x96,0x98,0x00,0x0C,0x00,0x80,0x00,0x0D,0x00,0x80,0x00,0x30,0x65,0x07,0x0C,
+  0x03,0xFC,0x05,0xEC,0x23,0x40,0x00,0x90,0x97,0x98,0x2B,0xFA,0x23,0x40,0x00,0x90,
+  0x93,0x98,0x25,0x40,0x00,0x90,0x90,0x98,0x30,0x6D,0xC0,0x46,0x0C,0x00,0x80,0x00,
+  0x10,0x65,0x04,0xEC,0x06,0xA0,0xFF,0x97,0xB1,0x9F,0x20,0xA0,0xFF,0x97,0xAE,0x9F,
+  0x20,0xEC,0xFF,0x97,0xE3,0x9F,0x03,0x0B,0x01,0xA2,0x1A,0x40,0xFF,0x97,0xBA,0x9F,
+  0x10,0x6D,0xC0,0x46,0x0D,0x00,0x80,0x00,0xF0,0x65,0x04,0xEC,0x03,0xA0,0x0D,0xEC,
+  0x16,0xEC,0x0E,0x0F,0xFF,0x97,0x9A,0x9F,0x20,0xEC,0xFF,0x97,0xCF,0x9F,0x00,0xA3,
+  0x3B,0x40,0x00,0x90,0x69,0x98,0x0A,0x0B,0x0A,0xA2,0x1A,0x40,0x00,0x90,0x64,0x98,
+  0x00,0xAD,0x07,0xC0,0x00,0xA4,0x3B,0x48,0x33,0x15,0x01,0xB4,0x00,0x90,0x5C,0x98,
+  0xAC,0x02,0xF8,0xC1,0x02,0x0B,0x01,0xA2,0x1A,0x40,0xF0,0x6D,0x0C,0x00,0x80,0x00,
+  0x0D,0x00,0x80,0x00,0xF0,0x65,0x04,0xEC,0x06,0xA0,0x0D,0xEC,0x16,0xEC,0xFF,0x97,
+  0x75,0x9F,0x02,0xA0,0xFF,0x97,0x72,0x9F,0x20,0xEC,0xFF,0x97,0xA7,0x9F,0x00,0xAD,
+  0x08,0xC0,0x07,0x0F,0x00,0xA4,0x33,0x1D,0x01,0xB4,0x3B,0x40,0x00,0x90,0x3C,0x98,
+  0xA5,0x02,0xF8,0xC8,0x03,0x0B,0x01,0xA2,0x1A,0x40,0xFF,0x97,0x73,0x9F,0xF0,0x6D,
+  0x0C,0x00,0x80,0x00,0x0D,0x00,0x80,0x00,0x06,0x09,0x0B,0x58,0x81,0x60,0x00,0x33,
+  0x43,0xF0,0x18,0xE8,0xC0,0xF0,0x0A,0x58,0x00,0x3B,0xD3,0xEA,0x83,0x02,0xFA,0xC9,
+  0x01,0x60,0x70,0x07,0x30,0x06,0x80,0x00,0x10,0x65,0x94,0xE0,0x00,0xAC,0x05,0xCD,
+  0x00,0xA3,0x04,0xD9,0x01,0xB3,0x04,0xD0,0xA3,0x02,0xFA,0xC1,0x10,0x6D,0xC0,0x46,
+  0x10,0x65,0x09,0xF4,0x49,0xFC,0x03,0xEC,0x00,0xA0,0x00,0xA9,0x0B,0xC0,0x4C,0xEE,
+  0x24,0xF4,0xE4,0xFB,0x02,0xB4,0x00,0xA2,0x99,0x1A,0x40,0xE8,0x00,0xF4,0x02,0xB2,
+  0x00,0xFC,0xA2,0x02,0xF8,0xC1,0x10,0x6D,0x30,0x65,0x06,0x0D,0x2B,0x48,0xDA,0xF6,
+  0x06,0xC5,0x10,0xA4,0x1C,0xA0,0xFF,0x97,0xC7,0x9F,0x2B,0x48,0x1C,0x02,0xF9,0xC1,
+  0x30,0x6D,0xC0,0x46,0x0D,0x00,0x80,0x00,0x01,0x0B,0x01,0xA2,0x1A,0x40,0x70,0x07,
+  0x0D,0x00,0x80,0x00,0x01,0x0B,0x00,0xA2,0x1A,0x40,0x70,0x07,0x0D,0x00,0x80,0x00,
+  0x01,0x0B,0x18,0x40,0x70,0x07,0xC0,0x46,0x0C,0x00,0x80,0x00,0x01,0x0B,0x18,0x40,
+  0x70,0x07,0xC0,0x46,0x0D,0x00,0x80,0x00,0x01,0x0B,0x18,0x48,0x70,0x07,0xC0,0x46,
+  0x0C,0x00,0x80,0x00,0x10,0x65,0x03,0x0C,0x00,0xA3,0x23,0x40,0xFF,0x97,0xCC,0x9F,
+  0x20,0x48,0x10,0x6D,0x0C,0x00,0x80,0x00,0x10,0x65,0x04,0x0C,0x00,0xA3,0x23,0x40,
+  0xFF,0x97,0xC2,0x9F,0x23,0x48,0x01,0xA0,0x18,0x00,0x10,0x6D,0x0C,0x00,0x80,0x00,
+  0x30,0x65,0x80,0xA3,0xC2,0x28,0x5B,0xF1,0x9A,0x02,0x04,0xC0,0x0C,0x0B,0x1B,0x58,
+  0x05,0xA2,0x5A,0x40,0x30,0x6D,0x84,0x28,0x45,0x28,0x00,0xAC,0x0B,0xC0,0x2D,0xF3,
+  0x28,0xEC,0x01,0xBC,0xFF,0x97,0x1C,0x9F,0x24,0xF4,0x80,0xA3,0x5B,0xF1,0x24,0xFC,
+  0xED,0xE8,0x00,0xAC,0xF4,0xC1,0x02,0x0B,0x1B,0x58,0x00,0xA2,0x5A,0x40,0xE9,0x87,
+  0x04,0x8D,0x80,0x00,0x30,0x65,0x84,0x28,0x08,0x0D,0x21,0xEC,0x2A,0xEC,0x40,0x28,
+  0xFF,0x97,0x1A,0x9F,0x28,0xEC,0x21,0xEC,0x00,0x90,0xC4,0x99,0x04,0x0B,0x1B,0x58,
+  0x00,0xA2,0x58,0x20,0x00,0xFC,0x98,0x20,0x5A,0x40,0x30,0x6D,0x00,0x90,0x80,0x00,
+  0x04,0x8D,0x80,0x00,0xF0,0x65,0x5F,0x06,0x56,0x06,0x4D,0x06,0x44,0x06,0xF0,0x64,
+  0x83,0x28,0x42,0x28,0x04,0xEC,0x19,0xEC,0x38,0x08,0x92,0x06,0x99,0x06,0x00,0x90,
+  0xA9,0x99,0xA3,0x29,0xE2,0x28,0x1B,0xF4,0x9B,0xE8,0x83,0x02,0x09,0xC0,0x34,0x0B,
+  0x1B,0x58,0x03,0xA2,0x5A,0x40,0x3C,0x6C,0x90,0x06,0x99,0x06,0xA2,0x06,0xAB,0x06,
+  0xF0,0x6D,0x54,0x06,0x23,0xF5,0x00,0xAB,0x4E,0xC0,0x00,0xA2,0x91,0x05,0x4F,0xC0,
+  0x80,0xA3,0x5C,0xF0,0x4D,0x06,0x00,0xA7,0xA3,0x06,0x2C,0xEC,0x5D,0x05,0x01,0xC9,
+  0x80,0xA4,0x64,0xF0,0x25,0x0B,0xB8,0x06,0xFE,0xE8,0xD0,0x04,0x40,0x06,0x21,0xEC,
+  0x32,0xEC,0xFF,0x97,0xF7,0x9E,0x2D,0xEB,0x40,0x06,0x21,0xEC,0x32,0xEC,0xFF,0x97,
+  0xF1,0x9E,0x3F,0xE9,0x00,0xAD,0xE8,0xC1,0x80,0xA7,0x4D,0x06,0x00,0xA6,0x7F,0xF0,
+  0x2C,0xEC,0xBD,0x02,0x01,0xC9,0x80,0xA4,0x64,0xF0,0x1A,0x0B,0x30,0xEC,0xF2,0xE8,
+  0x50,0x04,0x21,0xEC,0x2D,0xEB,0xFF,0x97,0xB7,0x9E,0x36,0xE9,0x00,0xAD,0xEF,0xC1,
+  0x13,0x0B,0x18,0x58,0x11,0x0B,0x45,0x40,0x1A,0x48,0x12,0x0B,0x1B,0x48,0x9A,0x02,
+  0x0F,0xC1,0x00,0xA3,0x07,0x80,0x0D,0x0C,0x19,0xE9,0x0E,0x0C,0x1A,0xE9,0x09,0x48,
+  0x12,0x48,0x91,0x02,0x05,0xC1,0x01,0xB3,0x99,0x05,0xF4,0xC8,0x00,0xA3,0x43,0x20,
+  0xA9,0x87,0x09,0xA3,0x43,0x40,0xA6,0x87,0x50,0x06,0xFF,0x97,0x81,0x9E,0xAC,0x87,
+  0x03,0x0B,0x18,0x58,0x4A,0x06,0x42,0x40,0xF0,0x87,0xC0,0x46,0x00,0x90,0x80,0x00,
+  0x04,0x8D,0x80,0x00,0x80,0x94,0x80,0x00,0xF0,0x65,0x57,0x06,0x46,0x06,0xC0,0x64,
+  0x80,0xA3,0x07,0xF4,0x00,0xA4,0xDB,0xF0,0x3F,0xFC,0x00,0xA5,0xA0,0x06,0x9A,0x06,
+  0x3E,0xEC,0x57,0x05,0x01,0xC9,0x80,0xA6,0xF6,0xF0,0x36,0xF4,0x36,0xFC,0x40,0x06,
+  0x31,0xEC,0x15,0x0A,0xFF,0x97,0x70,0x9E,0x00,0xAE,0x19,0xC0,0x70,0xEE,0x13,0x0B,
+  0x00,0xF4,0x00,0xFC,0xC0,0xE8,0x42,0x06,0x01,0xBB,0x19,0x48,0x64,0xE8,0x51,0x03,
+  0x01,0xB2,0x6D,0xE8,0x24,0xF4,0x2D,0xF4,0x12,0xF4,0x01,0xB3,0x24,0xFC,0x2D,0xFC,
+  0x12,0xFC,0x83,0x02,0xF1,0xC1,0x33,0xEC,0x43,0x04,0x1B,0xF4,0x1B,0xFC,0x98,0x06,
+  0xBF,0xEB,0x3F,0xF4,0x3F,0xFC,0x00,0xAF,0xD2,0xC1,0x28,0xF4,0x20,0x03,0x0C,0x6C,
+  0x90,0x06,0x9A,0x06,0xF0,0x6D,0xC0,0x46,0x00,0x90,0x80,0x00,0x01,0x90,0x80,0x00,
+  0xF0,0x65,0x19,0x0C,0x00,0xA0,0x08,0xA1,0x22,0xEC,0xFF,0x97,0x3D,0x9E,0x23,0x58,
+  0x01,0xB3,0x1F,0xC0,0x15,0x0B,0x1C,0x28,0x80,0xA3,0x1B,0xF2,0xA3,0x02,0x00,0xC2,
+  0xF0,0x6D,0x13,0x0B,0x1E,0x28,0x13,0x0B,0xF6,0xE8,0x73,0xEE,0x9E,0x01,0x00,0xAE,
+  0xF6,0xC1,0x20,0xEC,0xFF,0x97,0xA0,0x9F,0x0B,0x0D,0x07,0xEC,0x08,0xA1,0x20,0xEC,
+  0x2A,0xEC,0xFF,0x97,0x21,0x9E,0x2B,0x58,0xBB,0x02,0xE9,0xC1,0x0A,0x0B,0x1B,0x58,
+  0x5E,0x40,0xE5,0x87,0x09,0x0B,0x1B,0x58,0x01,0xB3,0xDB,0xC1,0x06,0x0B,0x1B,0x58,
+  0x08,0xA2,0x5A,0x40,0xDC,0x87,0xC0,0x46,0x00,0x90,0x80,0x00,0x06,0x90,0x80,0x00,
+  0x02,0x90,0x80,0x00,0xCA,0xCA,0xFF,0xFF,0x04,0x8D,0x80,0x00,0x04,0x90,0x80,0x00,
+  0x70,0x65,0x22,0x0D,0x2B,0x58,0x0F,0xA2,0x1A,0x40,0x09,0xA2,0x5A,0x40,0x0C,0xA1,
+  0x04,0xEC,0xFF,0x97,0x5D,0x9E,0x23,0x48,0x00,0xA8,0x13,0xC1,0x62,0x48,0xD2,0xE8,
+  0xFF,0xAA,0x0F,0xC1,0x1A,0x0A,0x11,0x48,0x99,0x02,0x2B,0xC0,0x11,0x4A,0x99,0x02,
+  0x2A,0xC0,0x11,0x4C,0x99,0x02,0x11,0xC0,0x11,0x4E,0x03,0xA0,0x99,0x02,0x0E,0xC0,
+  0x28,0x58,0x03,0x80,0x28,0x58,0x03,0xA3,0x43,0x40,0x23,0x48,0x03,0x40,0x06,0xA1,
+  0xFF,0x97,0x3E,0x9E,0x2B,0x58,0x40,0x02,0xD8,0x20,0x70,0x6D,0x02,0xA0,0x0D,0x09,
+  0x00,0xA3,0x0B,0x40,0x80,0xB1,0x0B,0x40,0x0B,0x0E,0xC3,0xF0,0x05,0xA1,0xD2,0xE8,
+  0x53,0x58,0x20,0xEC,0x31,0x40,0x00,0x90,0x73,0x98,0x01,0xA3,0x33,0x40,0x28,0x58,
+  0x23,0x48,0xE3,0x87,0x00,0xA0,0xEA,0x87,0x01,0xA0,0xE8,0x87,0x04,0x8D,0x80,0x00,
+  0x7C,0x00,0x00,0x00,0x00,0x9E,0x80,0x00,0x03,0x00,0x80,0x00,0x30,0x65,0x0D,0x0C,
+  0x63,0x4A,0x35,0xAB,0x00,0xC0,0x30,0x6D,0xFA,0xA0,0x80,0xF0,0xFF,0x97,0xF4,0x9D,
+  0x09,0x0D,0x21,0xEC,0x10,0xA2,0x28,0xEC,0xFF,0x97,0xFE,0x9D,0x28,0xEC,0xFF,0x97,
+  0x9F,0x9F,0x06,0x08,0x06,0x09,0x10,0xA2,0xFF,0x97,0xF6,0x9D,0x30,0xA3,0x63,0x42,
+  0xE9,0x87,0xC0,0x46,0x00,0x9F,0x80,0x00,0x80,0x9F,0x80,0x00,0x40,0x9F,0x80,0x00,
+  0xC0,0x9F,0x80,0x00,0x00,0x65,0x13,0x0B,0x13,0x0A,0x19,0x58,0x0A,0x00,0x1A,0x50,
+  0x12,0x0B,0x55,0xA2,0x1A,0x40,0x12,0x0A,0x12,0x0B,0x1A,0x20,0x12,0x0A,0x13,0x0B,
+  0x1A,0x50,0x13,0x0A,0xFF,0xA3,0x1B,0xF6,0x13,0x50,0x01,0xA3,0x5B,0x02,0x04,0xB2,
+  0x13,0x20,0x10,0x0B,0x00,0xA2,0x10,0x09,0x1A,0x40,0x01,0xA3,0x0B,0x40,0x10,0xB1,
+  0x0A,0x50,0x0E,0x0A,0x13,0x40,0x80,0xA3,0x1B,0xF4,0x1F,0xA2,0x1A,0x40,0xFF,0x97,
+  0xB5,0x9F,0xFC,0x87,0x40,0x06,0x80,0x00,0xFF,0xFF,0xFF,0xFE,0x10,0x04,0x80,0x00,
+  0x00,0x9E,0xFF,0xFF,0x28,0x00,0x80,0x00,0xC0,0x9F,0x80,0x00,0x04,0x8D,0x80,0x00,
+  0x60,0x00,0x80,0x00,0x68,0x00,0x80,0x00,0x20,0x06,0x80,0x00,0x03,0x00,0x80,0x00,
+  0x18,0x07,0xC0,0x46,0x30,0x65,0x0D,0xF4,0x2D,0xFC,0x03,0xEC,0x00,0xA0,0x00,0xAD,
+  0x14,0xC0,0x19,0x48,0x00,0xA4,0x01,0xB3,0x00,0xA2,0x01,0x80,0x19,0x48,0x01,0xB3,
+  0x08,0xE8,0x51,0x03,0x01,0xB2,0x64,0xE8,0x12,0xF4,0x00,0xF4,0x24,0xF4,0x12,0xFC,
+  0x00,0xFC,0x24,0xFC,0x95,0x02,0xF1,0xC8,0x24,0xF4,0x20,0x03,0x30,0x6D,0xC0,0x46
+};
 static_assert(sizeof(fw_fcode_burn) == 1776, "Unexpected CHSC6X burn helper size");
 
 void put_le16(uint8_t *data, uint16_t value)
@@ -103,6 +203,9 @@ public:
     explicit chsc6x_burn(chsc6x_platform &bus) : bus_(bus) {}
 
     bool start();
+    bool read_flash(uint16_t addr, uint8_t *data, uint16_t len);
+    chsc6x_compare_status compare_flash(uint16_t addr, const uint8_t *target, uint16_t len,
+                                        int32_t &firstDifference);
     bool write_cfg(const uint8_t *data);
     bool write_boot(const uint8_t *data, uint16_t len);
 
@@ -114,7 +217,8 @@ private:
     bool load_checked(uint16_t addr, const uint8_t *data, uint16_t len);
     command_result send_command(uint8_t id, uint16_t addr, uint16_t len,
                                 uint32_t checksum, uint8_t (&response)[8]);
-    bool transfer_block(uint8_t id, uint16_t addr, const uint8_t *data, uint16_t len);
+    chsc6x_compare_status verify_flash(uint16_t addr, const uint8_t *expected, uint16_t len);
+    bool write_block(uint16_t addr, const uint8_t *data, uint16_t len);
     bool program(uint16_t addr, const uint8_t *data, uint16_t len);
 
     chsc6x_platform &bus_;
@@ -229,26 +333,113 @@ chsc6x_burn::command_result chsc6x_burn::send_command(
     return command_result::stop;
 }
 
-bool chsc6x_burn::transfer_block(uint8_t id, uint16_t addr, const uint8_t *data, uint16_t len)
+bool chsc6x_burn::read_flash(uint16_t addr, uint8_t *data, uint16_t len)
 {
-    const uint32_t expected = checksum_ex(data, len);
+    if (!data || len == 0 || len > block_size || uint32_t(addr) + len > 0x10000UL) {
+        return false;
+    }
     for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
-        if (id == write_command && !write_ram(data_address, data, len)) {
-            continue;
-        }
         uint8_t response[8];
-        const auto result = send_command(id, addr, len, id == write_command ? expected : 0, response);
+        const auto result = send_command(read_command, addr, len, 0, response);
         if (result == command_result::stop) {
             return false;
         }
+        if (result != command_result::ok) {
+            continue;
+        }
+
+        uint16_t offset = 0;
+        while (offset < len) {
+            const uint16_t remaining = len - offset;
+            const uint16_t count = remaining < MAX_IIC_RD_LEN ? remaining : MAX_IIC_RD_LEN;
+            if (bus_.chsc6x_read_bytes_u16addr(bus_._i2c_addr, data_address + offset,
+                                               data + offset, count) != OS_OK) {
+                break;
+            }
+            offset += count;
+        }
+        // The helper checksum describes the bytes in flash, including any genuine mismatch.
+        if (offset == len && checksum_ex(data, len) == le32(response + 2)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+chsc6x_compare_status chsc6x_burn::verify_flash(uint16_t addr, const uint8_t *expected, uint16_t len)
+{
+    uint8_t actual[block_size];
+    auto result = chsc6x_compare_status::identical;
+    while (len > 0) {
+        const uint16_t count = len < block_size ? len : block_size;
+        if (!read_flash(addr, actual, count)) {
+            return chsc6x_compare_status::read_error;
+        }
+        if (memcmp(actual, expected, count) != 0) {
+            result = chsc6x_compare_status::different;
+        }
+        addr += count;
+        expected += count;
+        len -= count;
+    }
+    return result;
+}
+
+chsc6x_compare_status chsc6x_burn::compare_flash(uint16_t addr, const uint8_t *target, uint16_t len,
+                                                int32_t &firstDifference)
+{
+    firstDifference = -1;
+    if (!target || len == 0 || uint32_t(addr) + len > 0x10000UL) {
+        return chsc6x_compare_status::read_error;
+    }
+    uint8_t actual[block_size];
+    int32_t first = -1;
+    uint16_t offset = 0;
+    while (offset < len) {
+        const uint16_t remaining = len - offset;
+        const uint16_t count = remaining < block_size ? remaining : block_size;
+        const uint16_t blockAddress = addr + offset;
+        if (!read_flash(blockAddress, actual, count)) {
+            return chsc6x_compare_status::read_error;
+        }
+        uint16_t i = 0;
+        while (i < count && actual[i] == target[offset + i]) {
+            ++i;
+        }
+        if (i < count) {
+            // Confirm the whole first snapshot, including any bytes that matched the package.
+            const auto confirmation = verify_flash(blockAddress, actual, count);
+            if (confirmation == chsc6x_compare_status::read_error) {
+                return confirmation;
+            }
+            if (confirmation == chsc6x_compare_status::different) {
+                return chsc6x_compare_status::inconsistent_reads;
+            }
+            if (first < 0) {
+                first = offset + i;
+            }
+        }
+        offset += count;
+    }
+    // Publish a difference only after the entire requested region was read reliably.
+    firstDifference = first;
+    return first < 0 ? chsc6x_compare_status::identical : chsc6x_compare_status::different;
+}
+
+bool chsc6x_burn::write_block(uint16_t addr, const uint8_t *data, uint16_t len)
+{
+    const uint32_t checksum = checksum_ex(data, len);
+    for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
+        if (!write_ram(data_address, data, len)) {
+            continue;
+        }
+        uint8_t response[8];
+        const auto result = send_command(write_command, addr, len, checksum, response);
         if (result == command_result::ok) {
-            if (id == write_command) {
-                return true;
-            }
-            if (le32(response + 2) == expected &&
-                matches_ram(data_address, data, len)) {
-                return true;
-            }
+            return true;
+        }
+        if (result == command_result::stop) {
+            return false;
         }
     }
     return false;
@@ -257,9 +448,9 @@ bool chsc6x_burn::transfer_block(uint8_t id, uint16_t addr, const uint8_t *data,
 bool chsc6x_burn::program(uint16_t addr, const uint8_t *data, uint16_t len)
 {
     while (len > 0) {
-        const uint16_t count = len > block_size ? block_size : len;
-        if (!transfer_block(write_command, addr, data, count) ||
-            !transfer_block(read_command, addr, data, count)) {
+        const uint16_t count = len < block_size ? len : block_size;
+        if (!write_block(addr, data, count) ||
+            verify_flash(addr, data, count) != chsc6x_compare_status::identical) {
             return false;
         }
         addr += count;
@@ -271,7 +462,7 @@ bool chsc6x_burn::program(uint16_t addr, const uint8_t *data, uint16_t len)
 
 bool chsc6x_burn::write_cfg(const uint8_t *data)
 {
-    return data && program(cfg_address, data, 204);
+    return data && program(cfg_address, data, sizeof(chsc6x_cfg::bytes));
 }
 
 bool chsc6x_burn::write_boot(const uint8_t *data, uint16_t len)
@@ -279,245 +470,234 @@ bool chsc6x_burn::write_boot(const uint8_t *data, uint16_t len)
     if (!data || len <= 8 || len > cfg_address || data[8] != 0x4B) {
         return false;
     }
-    // Vendor sequence writes the entire supplied image, then rewrites byte 8.
-    // Read back the first block again after this last write.
-    return program(0, data, len) && transfer_block(write_command, 8, data + 8, 1) &&
-           transfer_block(read_command, 0, data, len > block_size ? block_size : len);
+    // The vendor writes the complete image, then programs byte 8 again.
+    return program(0, data, len) && write_block(8, data + 8, 1) &&
+           verify_flash(0, data, len) == chsc6x_compare_status::identical;
 }
 
-} // namespace
-
-// Read the running image and coordinate reset, programming and verification.
-int chsc6x::read_running_cfg(chsc6x_cfg &cfg)
+bool read_probe_register(chsc6x_platform &bus, uint16_t address, uint8_t *data, uint16_t length)
 {
-    for (size_t offset = 0; offset < sizeof(cfg.bytes); offset += MAX_IIC_RD_LEN) {
-        const size_t remaining = sizeof(cfg.bytes) - offset;
-        const size_t count = remaining < MAX_IIC_RD_LEN ? remaining : MAX_IIC_RD_LEN;
-        if (chsc6x_read_bytes_u16addr(_i2c_addr, 0x9E00 + offset, cfg.bytes + offset, count) != OS_OK) {
-            return CHSC6X_CFG_READ_FAILED;
+    for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
+        if (bus.chsc6x_read_bytes_u16addr(bus._i2c_addr, address, data, length) == OS_OK) {
+            return true;
         }
     }
-
-    const uint16_t checksum = sum16(cfg.bytes, sizeof(cfg.bytes));
-    return cfg.bytes[106] == (_i2c_addr << 1) && checksum == 0 ? OS_OK : CHSC6X_CFG_INVALID;
+    return false;
 }
 
-// Called in direct mode. With no RST the helper can survive an ESP32 restart.
-chsc6x::probe_state chsc6x::read_running_versions(chsc6x_versions &versions, uint32_t &identity)
+bool select_parts(uint32_t identity, const UpdateImage &image, chsc6x_update_result &report)
 {
-    uint8_t header[12];
-    chsc6x_cfg cfg;
-    probe_state state = probe_state::unreadable;
-    for (int attempt = 0; attempt < TP_RETRY_CNT2; ++attempt) {
-        if (attempt > 0) {
-            chsc6x_msleep(20);
-        }
-        if (chsc6x_read_bytes_u16addr(_i2c_addr, 0x8000, header, sizeof(header)) != OS_OK) {
-            continue;
-        }
-        if (le32(header) == burnHelper) {
-            return probe_state::burn_helper;
-        }
-        if (le32(header) != chip3536) {
-            return probe_state::unsupported;
-        }
-        const uint16_t boot = le16(header + 4);
-        if (le32(header + 8) != runningTag || boot == 0 || boot == 0xFFFF) {
-            state = probe_state::unreadable;
-            continue;
-        }
-        if (read_running_cfg(cfg) != OS_OK) {
-            state = probe_state::cfg_unreadable;
-            continue;
-        }
-        versions = {cfg.version(), boot};
-        identity = le32(cfg.bytes) & cfgIdentityMask;
-        return probe_state::running;
-    }
-    return state;
+    const bool cfg = identity == image.cfg_identity;
+    const bool boot = (identity & bootIdentityMask) == image.boot_match;
+    report.cfg.comparison = cfg ? chsc6x_compare_status::not_checked : chsc6x_compare_status::not_applicable;
+    report.boot.comparison = boot ? chsc6x_compare_status::not_checked : chsc6x_compare_status::not_applicable;
+    return cfg || boot;
 }
 
-void chsc6x::restore_touch_mode(bool usable)
+bool compare_part(chsc6x_burn &burner, uint16_t address, const uint8_t *data, uint16_t length,
+                  bool force, chsc6x_part_result &part)
 {
-    if (set_cfg_direct_mode(false) != OS_OK) {
-        init_result.status = chsc6x_init_status::error;
-        init_result.stage = "restore_mapping";
-        init_result.touch_ready = false;
-        return;
-    }
-    init_result.touch_ready = usable;
-}
-
-bool chsc6x::prepare_controller(bool hasReset, const chsc6x_init_result &previous, bool &skipUpdate)
-{
-    semi_touch_get_int();
-    if (semi_touch_i2c_init() != OS_OK) {
-        if (!hasReset && previous.needs_power_cycle) {
-            init_result = previous;
-        }
-        return false;
-    }
-    init_result.stage = "probe";
-    chsc6x_msleep(60);
-    if (hasReset) {
-        chsc6x_tp_reset(HW_CMD_RESET);
+    if (part.comparison == chsc6x_compare_status::not_applicable) {
         return true;
     }
+    if (force) {
+        part.comparison = chsc6x_compare_status::forced;
+        return true;
+    }
+    part.comparison = burner.compare_flash(address, data, length, part.first_difference);
+    return part.comparison == chsc6x_compare_status::identical ||
+           part.comparison == chsc6x_compare_status::different;
+}
 
-    // A cold-started touch controller returns to mapping mode. A stopped
-    // MCU can still expose its OLD boot/cfg in RAM before the helper loads.
-    bool direct = false;
-    const bool modeKnown = get_cfg_direct_mode(direct) == OS_OK;
-    if (previous.needs_power_cycle && (!modeKnown || direct)) {
-        init_result = previous;
-        chsc6x_info("CHSC6X: power-cycle the touch controller\r\n");
+bool needs_write(const chsc6x_part_result &part)
+{
+    return part.comparison == chsc6x_compare_status::different ||
+           part.comparison == chsc6x_compare_status::forced;
+}
+
+bool sync_parts(chsc6x_burn &burner, const UpdateImage &image, chsc6x_update_result &report,
+                chsc6x_init_result &init)
+{
+    const bool force = report.force_reason != nullptr;
+    init.stage = "compare_cfg";
+    if (!compare_part(burner, cfg_address, image.cfg, sizeof(chsc6x_cfg::bytes), force, report.cfg)) {
         return false;
     }
-    if (!modeKnown) {
-        // Retry only to recover touch. This init must skip programming.
-        skipUpdate = true;
-        init_result.stage = "read_mode";
-        if (get_cfg_direct_mode(direct) != OS_OK) {
-            chsc6x_err("CHSC6X: I2C mode unreadable, skipping update\r\n");
+    init.stage = "compare_boot";
+    if (!compare_part(burner, 0, image.boot, image.boot_size, force, report.boot)) {
+        return false;
+    }
+
+    if (needs_write(report.cfg)) {
+        init.stage = "cfg_write_verify";
+        report.cfg.write_attempted = true;
+        init.cfg_written = burner.write_cfg(image.cfg);
+        if (!init.cfg_written) {
             return false;
         }
     }
-    if (direct) {
-        uint8_t control = 0;
-        if (chsc6x_read_bytes_u16addr(_i2c_addr, 0x0602, &control, 1) != OS_OK) {
-            if (!skipUpdate) {
-                init_result.stage = "mcu_state";
-            }
-            skipUpdate = true;
-            if (chsc6x_read_bytes_u16addr(_i2c_addr, 0x0602, &control, 1) != OS_OK) {
-                init_result.stage = "mcu_state";
-                chsc6x_err(mcuReadWarning);
-                return false;
-            }
-        }
-        if (control == 0x05) {
-            init_result.status = chsc6x_init_status::power_cycle_required;
-            init_result.stage = "mcu_state";
-            init_result.needs_power_cycle = true;
-            chsc6x_info("CHSC6X: power-cycle the touch controller\r\n");
-            return false;
-        }
+    if (needs_write(report.boot)) {
+        init.stage = "boot_write_verify";
+        report.boot.write_attempted = true;
+        init.boot_written = burner.write_boot(image.boot, image.boot_size);
+        return init.boot_written;
     }
     return true;
 }
 
-void chsc6x::chsc6x_init()
-{
-    const chsc6x_init_result previous = init_result;
-    init_result = chsc6x_init_result{};
-    init_result.status = chsc6x_init_status::error;
-    init_result.stage = "i2c_init";
-    const bool hasReset = semi_touch_get_rst() >= 0;
-    bool skipUpdate = false;
-    if (!prepare_controller(hasReset, previous, skipUpdate)) {
-        return;
-    }
+} // namespace
 
-    uint32_t identity = 0;
-    const probe_state state = set_cfg_direct_mode(true) == OS_OK
-        ? read_running_versions(init_result.before, identity) : probe_state::unreadable;
-    if (state == probe_state::burn_helper) {
-        if (previous.needs_power_cycle) {
-            init_result = previous;
-        } else {
-            init_result.status = chsc6x_init_status::power_cycle_required;
-            init_result.stage = "burn_helper_active";
-        }
-        init_result.needs_power_cycle = true;
-        chsc6x_info("CHSC6X: power-cycle the touch controller\r\n");
-        return;
-    }
-    init_result.before_valid = state == probe_state::running;
-    if (init_result.before_valid && !skipUpdate) {
-        update_if_needed(identity, hasReset);
-        return;
-    }
-    if (state == probe_state::unsupported) {
-        init_result.status = chsc6x_init_status::incompatible;
-    }
-    if (skipUpdate) {
-        chsc6x_err("CHSC6X: I2C read failed at %s, skipping update\r\n", init_result.stage);
-    } else if (state == probe_state::cfg_unreadable) {
-        init_result.stage = "read_cfg";
-        chsc6x_err("CHSC6X: cfg unreadable, skipping update\r\n");
-    } else if (state == probe_state::unreadable) {
-        chsc6x_err("CHSC6X: running firmware unreadable, skipping update\r\n");
-    }
-    restore_touch_mode(init_result.before_valid || state == probe_state::cfg_unreadable);
+chsc6x_update_result chsc6x_updater::run(chsc6x &touch, const uint8_t *package, size_t length)
+{
+    chsc6x_update_result report;
+    report.init = maintain(touch, package, length, report);
+    return report;
 }
 
-void chsc6x::update_if_needed(uint32_t identity, bool hasReset)
+chsc6x_init_result chsc6x_updater::maintain(chsc6x &touch, const uint8_t *package, size_t length,
+                                           chsc6x_update_result &report)
 {
+    using probe = chsc6x::probe_state;
     UpdateImage image;
-    if (!open_image(image)) {
-        init_result.stage = "invalid_package";
-        restore_touch_mode(true);
-        return;
+    if (!open_image(package, length, image)) {
+        // Nothing touched the controller. Preserve any outstanding power-cycle requirement.
+        chsc6x_init_result invalid;
+        invalid.status = chsc6x_init_status::error;
+        invalid.stage = "invalid_package";
+        invalid.needs_power_cycle = touch.last_init_result().needs_power_cycle;
+        invalid.touch_ready = touch.last_init_result().touch_ready;
+        return invalid;
     }
-    const bool cfgMatches = identity == image.cfg_identity;
-    const bool bootMatches = (identity & bootIdentityMask) == image.boot_match;
-    if (!cfgMatches && !bootMatches) {
-        init_result.status = chsc6x_init_status::incompatible;
-        init_result.stage = "panel_identity";
-        restore_touch_mode(true);
-        return;
+    report.target = image.versions;
+    bool hasReset, readFault;
+    uint32_t identity;
+    chsc6x::maintenance_probe evidence;
+    const probe state = touch.begin_probe(hasReset, identity, readFault, &evidence);
+    report.boot_reads_inconsistent = evidence.boot_reads_inconsistent;
+    chsc6x_init_result &init = touch.init_result;
+    if (state == probe::blocked) {
+        return init;
     }
-    const bool writeCfg = cfgMatches && image.versions.cfg > init_result.before.cfg;
-    const bool writeBoot = bootMatches && image.versions.boot > init_result.before.boot;
-    if (!writeCfg && !writeBoot) {
-        init_result.status = chsc6x_init_status::current;
-        init_result.stage = "current";
-        init_result.after = init_result.before;
-        init_result.after_valid = true;
-        restore_touch_mode(true);
-        return;
+    const bool repairable = state == probe::cfg_invalid || state == probe::boot_invalid ||
+                            state == probe::unknown_header;
+    if (readFault || (state != probe::running && !repairable)) {
+        report.cfg_reads_inconsistent = state == probe::cfg_inconsistent;
+        touch.restore_touch_mode(state == probe::running || state == probe::cfg_invalid ||
+                                 state == probe::cfg_unreadable || report.cfg_reads_inconsistent);
+        return init;
     }
 
-    chsc6x_burn burner(*this);
-    init_result.stage = "load_helper";
+    if (state == probe::running) {
+        if (!select_parts(identity, image, report)) {
+            init.status = chsc6x_init_status::incompatible;
+            init.stage = "panel_identity";
+            touch.restore_touch_mode(true);
+            return init;
+        }
+    } else if (state == probe::unknown_header) {
+        // Vendor fallback for an empty/corrupt boot header. An I2C ACK alone is insufficient.
+        uint8_t rom[3];
+        if (!read_probe_register(touch, 0x0009, rom, sizeof(rom))) {
+            init.stage = "read_rom_id";
+            touch.restore_touch_mode(false);
+            return init;
+        }
+        const uint32_t id = le16(rom) | (uint32_t(rom[2]) << 16);
+        if (id != 0x444240 && id != 0x5C5C5C) {
+            init.status = chsc6x_init_status::incompatible;
+            init.stage = "chip_family";
+            touch.restore_touch_mode(false);
+            return init;
+        }
+    }
+
+    chsc6x_burn burner(touch);
+    init.stage = "load_helper";
     bool ok = burner.start();
-    if (ok && writeCfg) {
-        init_result.stage = "cfg_write_verify";
-        init_result.cfg_written = burner.write_cfg(image.cfg);
-        ok = init_result.cfg_written;
+    if (ok && state != probe::running) {
+        chsc6x_cfg factory;
+        init.stage = "read_factory_cfg";
+        ok = burner.read_flash(0xF000, factory.bytes, sizeof(factory.bytes));
+        if (ok && !chsc6x::valid_cfg(factory, touch._i2c_addr)) {
+            // An invalid factory cfg can override panel identification only if it is repeatable.
+            chsc6x_cfg &previousCfg = evidence.first_bad_cfg;
+            for (int attempt = 1; ok && attempt < TP_RETRY_CNT2; ++attempt) {
+                ok = burner.read_flash(0xF000, previousCfg.bytes, sizeof(previousCfg.bytes));
+                if (ok && memcmp(factory.bytes, previousCfg.bytes, sizeof(factory.bytes)) != 0) {
+                    report.cfg_reads_inconsistent = true;
+                    init.stage = "cfg_read_unreliable";
+                    chsc6x_err("CHSC6X: factory cfg reads disagree\r\n");
+                    ok = false;
+                }
+            }
+            report.assumed_panel = ok;
+        }
+        if (ok) {
+            identity = report.assumed_panel ? image.cfg_identity : (le32(factory.bytes) & cfgIdentityMask);
+            ok = select_parts(identity, image, report);
+            if (ok) {
+                report.force_reason = state == probe::cfg_invalid ? "invalid running cfg" : "invalid boot header";
+            } else {
+                init.status = chsc6x_init_status::incompatible;
+                init.stage = "factory_panel_identity";
+            }
+        }
     }
-    if (ok && writeBoot) {
-        init_result.stage = "boot_write_verify";
-        init_result.boot_written = burner.write_boot(image.boot, image.boot_size);
-        ok = init_result.boot_written;
+    if (ok) {
+        ok = sync_parts(burner, image, report, init);
     }
 
-    // The helper replaces the normal firmware in RAM. Changing the I2C mode
-    // alone cannot reload the running firmware from nonvolatile storage.
+    // Even a read-only comparison runs the helper in place of normal touch firmware.
+    const bool wrote = init.cfg_written || init.boot_written;
     if (!hasReset) {
-        init_result.needs_power_cycle = true;
+        init.needs_power_cycle = true;
         if (ok) {
-            init_result.status = chsc6x_init_status::power_cycle_required;
-            init_result.stage = "written_verified";
+            init.status = chsc6x_init_status::power_cycle_required;
+            init.stage = wrote ? "written_verified" : "identical";
         }
-        chsc6x_info("CHSC6X: power-cycle the touch controller\r\n");
-        return;
+        return init;
     }
-    chsc6x_tp_reset(HW_CMD_RESET);
-    uint32_t identityAfterReset = 0;
-    const bool normal = set_cfg_direct_mode(true) == OS_OK &&
-        read_running_versions(init_result.after, identityAfterReset) == probe_state::running;
-    init_result.after_valid = normal;
+
+    touch.chsc6x_tp_reset(HW_CMD_RESET);
+    if (touch.set_cfg_direct_mode(true) != OS_OK) {
+        if (ok) {
+            init.stage = "verify_mode";
+        }
+        return init;
+    }
+    uint8_t control;
+    if (!read_probe_register(touch, 0x0602, &control, 1)) {
+        if (ok) {
+            init.stage = "verify_mcu_state";
+        }
+        return init;
+    }
+    uint32_t afterIdentity = 0;
+    const probe after = control == 0x05 ? probe::blocked : touch.read_running_versions(init.after, afterIdentity);
+    init.needs_power_cycle = after == probe::blocked || after == probe::burn_helper;
+    if (init.needs_power_cycle) {
+        if (ok) {
+            init.status = chsc6x_init_status::power_cycle_required;
+            init.stage = "reset_not_effective";
+        }
+        return init;
+    }
+
+    init.after_valid = after == probe::running;
     if (ok) {
-        const uint8_t expectedCfg = writeCfg ? image.versions.cfg : init_result.before.cfg;
-        const uint16_t expectedBoot = writeBoot ? image.versions.boot : init_result.before.boot;
-        if (normal && identityAfterReset == identity && init_result.after.cfg == expectedCfg &&
-            init_result.after.boot == expectedBoot) {
-            init_result.status = chsc6x_init_status::updated;
-            init_result.stage = "verified";
+        const bool cfgApplicable = report.cfg.comparison != chsc6x_compare_status::not_applicable;
+        const bool cfgOk = cfgApplicable ? init.after.cfg == image.versions.cfg
+                                         : !init.before_valid || init.after.cfg == init.before.cfg;
+        if (init.after_valid && afterIdentity == identity && cfgOk && init.after.boot == image.versions.boot) {
+            init.status = wrote ? chsc6x_init_status::updated : chsc6x_init_status::current;
+            init.stage = wrote ? "verified" : "identical";
         } else {
-            init_result.stage = "verify_running";
+            init.stage = "verify_running";
         }
     }
-    restore_touch_mode(normal);
+    // Only switch back to mapping once the post-reset header identifies normal firmware.
+    if (init.after_valid || after == probe::cfg_unreadable || after == probe::cfg_invalid) {
+        touch.restore_touch_mode(true);
+    }
+    return init;
 }

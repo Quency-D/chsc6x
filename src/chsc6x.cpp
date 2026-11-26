@@ -1,4 +1,238 @@
 #include "chsc6x.h"
+#include "detail/chsc6x_bytes.h"
+#include <string.h>
+
+namespace {
+constexpr uint32_t chip3536 = 0x35368008;
+constexpr uint32_t runningTag = 0x544C4E4B;
+constexpr uint32_t burnHelper = 0x6D6F8008;
+constexpr uint32_t cfgIdentityMask = 0x03FFFFFF;
+} // namespace
+
+bool chsc6x::valid_cfg(const chsc6x_cfg &cfg, uint8_t addr)
+{
+    return cfg.bytes[106] == (addr << 1) && chsc6x_bytes::sum16(cfg.bytes, sizeof(cfg.bytes)) == 0;
+}
+
+int chsc6x::read_running_cfg(chsc6x_cfg &cfg)
+{
+    for (size_t offset = 0; offset < sizeof(cfg.bytes); offset += MAX_IIC_RD_LEN) {
+        const size_t remaining = sizeof(cfg.bytes) - offset;
+        const size_t count = remaining < MAX_IIC_RD_LEN ? remaining : MAX_IIC_RD_LEN;
+        if (chsc6x_read_bytes_u16addr(_i2c_addr, 0x9E00 + offset, cfg.bytes + offset, count) != OS_OK) {
+            return CHSC6X_CFG_READ_FAILED;
+        }
+    }
+    return valid_cfg(cfg, _i2c_addr) ? OS_OK : CHSC6X_CFG_INVALID;
+}
+
+chsc6x::probe_state chsc6x::read_running_versions(chsc6x_versions &versions, uint32_t &identity,
+                                                     maintenance_probe *maintenance)
+{
+    bool haveBootHeader = false;
+    unsigned badCfgReads = 0;
+    probe_state state = probe_state::unreadable;
+    bool transportFailed = false;
+    for (int attempt = 0; attempt < TP_RETRY_CNT2; ++attempt) {
+        if (attempt > 0) {
+            chsc6x_msleep(20);
+        }
+        uint8_t header[12];
+        if (chsc6x_read_bytes_u16addr(_i2c_addr, 0x8000, header, sizeof(header)) != OS_OK) {
+            transportFailed = true;
+            continue;
+        }
+        const uint32_t family = chsc6x_bytes::le32(header);
+        if (maintenance) {
+            if (!haveBootHeader) {
+                memcpy(maintenance->first_boot_header, header, sizeof(header));
+                haveBootHeader = true;
+            } else if (memcmp(maintenance->first_boot_header, header, sizeof(header)) != 0) {
+                maintenance->boot_reads_inconsistent = true;
+                // A live RAM helper still requires a power cycle.
+                return family == burnHelper ? probe_state::burn_helper : probe_state::unreadable;
+            }
+        }
+        const uint32_t tag = chsc6x_bytes::le32(header + 8);
+        if (family == burnHelper) {
+            return probe_state::burn_helper;
+        }
+        // The vendor recognizes a partial TLNK signature with an invalid low byte.
+        if ((tag & 0xFFFFFF00) != (runningTag & 0xFFFFFF00)) {
+            state = probe_state::unknown_header;
+            continue;
+        }
+        if (family != chip3536) {
+            return probe_state::unsupported;
+        }
+        const uint16_t boot = chsc6x_bytes::le16(header + 4);
+        if (tag != runningTag || boot == 0 || boot == 0xFFFF) {
+            state = probe_state::boot_invalid;
+            continue;
+        }
+        versions.boot = boot;
+        chsc6x_cfg cfg;
+        const int status = read_running_cfg(cfg);
+        if (status != OS_OK && status != CHSC6X_CFG_INVALID) {
+            transportFailed = true;
+            state = probe_state::cfg_unreadable;
+            continue;
+        }
+        if (badCfgReads && memcmp(maintenance->first_bad_cfg.bytes, cfg.bytes, sizeof(cfg.bytes)) != 0) {
+            return probe_state::cfg_inconsistent;
+        }
+        if (status == OS_OK) {
+            versions.cfg = cfg.version();
+            identity = chsc6x_bytes::le32(cfg.bytes) & cfgIdentityMask;
+            return probe_state::running;
+        }
+        if (maintenance) {
+            if (badCfgReads == 0) {
+                maintenance->first_bad_cfg = cfg;
+            }
+            ++badCfgReads;
+        }
+        state = probe_state::cfg_invalid;
+    }
+
+    // Recovery requires a complete, matching snapshot on every probe attempt.
+    if (transportFailed || (badCfgReads != 0 && badCfgReads != TP_RETRY_CNT2)) {
+        return state == probe_state::cfg_invalid || state == probe_state::cfg_unreadable
+            ? probe_state::cfg_unreadable : probe_state::unreadable;
+    }
+    return state;
+}
+
+void chsc6x::require_power_cycle(const char *stage)
+{
+    init_result.status = chsc6x_init_status::power_cycle_required;
+    init_result.stage = stage;
+    init_result.needs_power_cycle = true;
+    init_result.touch_ready = false;
+    chsc6x_info("CHSC6X: power-cycle the touch controller\r\n");
+}
+
+void chsc6x::restore_touch_mode(bool usable)
+{
+    if (set_cfg_direct_mode(false) != OS_OK) {
+        init_result.status = chsc6x_init_status::error;
+        init_result.stage = "restore_mapping";
+        init_result.touch_ready = false;
+        return;
+    }
+    init_result.touch_ready = usable;
+}
+
+bool chsc6x::prepare_controller(bool hasReset, bool wasWaiting, bool &readFault)
+{
+    semi_touch_get_int();
+    if (semi_touch_i2c_init() != OS_OK) {
+        if (!hasReset && wasWaiting) {
+            require_power_cycle("await_power_cycle");
+        }
+        return false;
+    }
+    init_result.stage = "probe";
+    chsc6x_msleep(60);
+    if (hasReset) {
+        chsc6x_tp_reset(HW_CMD_RESET);
+        return true;
+    }
+
+    // A stopped MCU can retain its old boot and cfg in RAM across a host restart.
+    bool direct = false;
+    const bool modeKnown = get_cfg_direct_mode(direct) == OS_OK;
+    if (wasWaiting && (!modeKnown || direct)) {
+        require_power_cycle("await_power_cycle");
+        return false;
+    }
+    if (!modeKnown) {
+        readFault = true;
+        init_result.stage = "read_mode";
+        if (get_cfg_direct_mode(direct) != OS_OK) {
+            chsc6x_err("CHSC6X: I2C mode unreadable\r\n");
+            return false;
+        }
+    }
+    if (direct) {
+        uint8_t control;
+        if (chsc6x_read_bytes_u16addr(_i2c_addr, 0x0602, &control, 1) != OS_OK) {
+            if (!readFault) {
+                init_result.stage = "mcu_state";
+            }
+            readFault = true;
+            if (chsc6x_read_bytes_u16addr(_i2c_addr, 0x0602, &control, 1) != OS_OK) {
+                init_result.stage = "mcu_state";
+                chsc6x_err("CHSC6X: MCU state unreadable\r\n");
+                return false;
+            }
+        }
+        if (control == 0x05) {
+            require_power_cycle("mcu_state");
+            return false;
+        }
+    }
+    return true;
+}
+
+chsc6x::probe_state chsc6x::begin_probe(bool &hasReset, uint32_t &identity, bool &readFault,
+                                            maintenance_probe *maintenance)
+{
+    const bool wasWaiting = init_result.needs_power_cycle;
+    init_result = chsc6x_init_result{};
+    init_result.status = chsc6x_init_status::error;
+    init_result.stage = "i2c_init";
+    hasReset = semi_touch_get_rst() >= 0;
+    identity = 0;
+    readFault = false;
+    if (!prepare_controller(hasReset, wasWaiting, readFault)) {
+        return probe_state::blocked;
+    }
+
+    const probe_state state = set_cfg_direct_mode(true) == OS_OK
+        ? read_running_versions(init_result.before, identity, maintenance) : probe_state::unreadable;
+    if (state == probe_state::burn_helper) {
+        require_power_cycle("burn_helper_active");
+        return probe_state::blocked;
+    }
+
+    init_result.before_valid = state == probe_state::running;
+    if (state == probe_state::unsupported) {
+        init_result.status = chsc6x_init_status::incompatible;
+    }
+    if (maintenance && maintenance->boot_reads_inconsistent) {
+        init_result.stage = "boot_read_unreliable";
+        chsc6x_err("CHSC6X: running boot header reads disagree\r\n");
+    } else if (state == probe_state::cfg_inconsistent) {
+        init_result.stage = "cfg_read_unreliable";
+        chsc6x_err("CHSC6X: running cfg reads disagree\r\n");
+    } else if (readFault) {
+        chsc6x_err("CHSC6X: I2C read failed at %s\r\n", init_result.stage);
+    } else if (state == probe_state::cfg_invalid || state == probe_state::cfg_unreadable) {
+        init_result.stage = "read_cfg";
+        chsc6x_err("CHSC6X: failed to read a valid running cfg\r\n");
+    } else if (state != probe_state::running) {
+        init_result.stage = "boot_header";
+        chsc6x_err("CHSC6X: failed to identify running firmware\r\n");
+    }
+    return state;
+}
+
+void chsc6x::chsc6x_init()
+{
+    bool hasReset, readFault;
+    uint32_t identity;
+    const probe_state state = begin_probe(hasReset, identity, readFault);
+    if (state == probe_state::blocked) {
+        return;
+    }
+    if (state == probe_state::running && !readFault) {
+        init_result.status = chsc6x_init_status::ready;
+        init_result.stage = "versions_read";
+    }
+    restore_touch_mode(state == probe_state::running || state == probe_state::cfg_unreadable ||
+                       state == probe_state::cfg_invalid);
+}
 
 int chsc6x::get_cfg_direct_mode(bool &direct)
 {

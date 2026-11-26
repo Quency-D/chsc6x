@@ -36,7 +36,7 @@ struct chsc6x_versions {
 };
 
 enum class chsc6x_init_status {
-    not_initialized, current, updated, incompatible, power_cycle_required, error
+    not_initialized, current, updated, incompatible, power_cycle_required, error, ready
 };
 
 struct chsc6x_init_result {
@@ -55,11 +55,24 @@ struct chsc6x_init_result {
 
 class chsc6x :public chsc6x_platform{
 private:
+    friend class chsc6x_updater;
+    enum class probe_state {
+        running, cfg_invalid, cfg_unreadable, cfg_inconsistent, boot_invalid, unknown_header,
+        unsupported, unreadable, burn_helper, blocked
+    };
+    struct maintenance_probe {
+        chsc6x_cfg first_bad_cfg;
+        uint8_t first_boot_header[12];
+        bool boot_reads_inconsistent = false;
+    };
     chsc6x_init_result init_result;
-    enum class probe_state { running, cfg_unreadable, burn_helper, unsupported, unreadable };
-    probe_state read_running_versions(chsc6x_versions &versions, uint32_t &identity);
-    bool prepare_controller(bool hasReset, const chsc6x_init_result &previous, bool &skipUpdate);
-    void update_if_needed(uint32_t identity, bool hasReset);
+    static bool valid_cfg(const chsc6x_cfg &cfg, uint8_t addr);
+    probe_state read_running_versions(chsc6x_versions &versions, uint32_t &identity,
+                                      maintenance_probe *maintenance = nullptr);
+    probe_state begin_probe(bool &hasReset, uint32_t &identity, bool &readFault,
+                            maintenance_probe *maintenance = nullptr);
+    bool prepare_controller(bool hasReset, bool wasWaiting, bool &readFault);
+    void require_power_cycle(const char *stage);
     void restore_touch_mode(bool usable);
     int get_cfg_direct_mode(bool &direct);
     int set_cfg_direct_mode(bool direct);
