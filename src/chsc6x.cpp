@@ -148,7 +148,7 @@ uint8_t chsc6x::chsc6x_get_gesture(void)
     if(g_gesture_enable && g_gesture_status)
 	{
         chsc6x_read_bytes_u8addr(_i2c_addr, 0xd3, rd_buf, 4);
-		chsc6x_info("chsc6x : gesture_id:%x; \r\n", rd_buf[0]);
+        chsc6x_info("chsc6x : gesture_id:%x; \r\n", rd_buf[0]);
         return rd_buf[0];
 	}
     return 0;
@@ -161,6 +161,10 @@ uint8_t chsc6x::chsc6x_get_gesture(void)
 
 void chsc6x::chsc6x_resume(void)    //Call when the display lights up
 {
+    if (!can_reset_for_sleep) {
+        return;
+    }
+
     chsc6x_info("chsc6x_resume enter.\r\n");
 
 #if CHSC6X_GESTURE
@@ -175,6 +179,10 @@ void chsc6x::chsc6x_resume(void)    //Call when the display lights up
 
 void chsc6x::chsc6x_suspend(void)    //Call when the display is off
 {
+    if (!can_reset_for_sleep) {
+        return;
+    }
+
     uint8_t buff[1] = {0};
 
 #if CHSC6X_GESTURE

@@ -64,6 +64,7 @@ private:
     int get_cfg_direct_mode(bool &direct);
     int set_cfg_direct_mode(bool direct);
     int read_running_cfg(chsc6x_cfg &cfg);
+    bool can_reset_for_sleep;
     uint8_t real_suspend_flag = 1;
 #if CHSC6X_GESTURE
     uint8_t g_gesture_enable = 1; 
@@ -71,8 +72,11 @@ private:
 #endif
 
 public:
-    chsc6x(TwoWire *wire = &Wire1, int sda_pin = -1, int scl_pin = -1, int int_pin = -1, int rst_pin = -1)
-        : chsc6x_platform(wire, sda_pin, scl_pin, int_pin, rst_pin)
+    // A shared reset pin is still used for initialization and firmware updates.
+    chsc6x(TwoWire *wire = &Wire1, int sda_pin = -1, int scl_pin = -1,
+           int int_pin = -1, int rst_pin = -1, bool rst_shared_with_tft = false)
+        : chsc6x_platform(wire, sda_pin, scl_pin, int_pin, rst_pin),
+          can_reset_for_sleep(rst_pin >= 0 && !rst_shared_with_tft)
     {
     };
     ~chsc6x(){};
