@@ -1,5 +1,5 @@
 #include <chsc6x_update.h>
-#include "firmware_05_12_V224_V4.h"
+#include <firmware/firmware_05_12_V224_V4.h>
 
 // Heltec V4R8 with TouchTFT V0.2. Change these settings for another board.
 constexpr int touchSda = 17;

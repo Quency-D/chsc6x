@@ -200,11 +200,12 @@ void put_le16(uint8_t *data, uint16_t value)
 // until it resets or power-cycles the touch controller after programming.
 class chsc6x_burn {
 public:
-    explicit chsc6x_burn(chsc6x_platform &bus) : bus_(bus) {}
+    chsc6x_burn(chsc6x_platform &bus, const chsc6x_update_observer &observer)
+        : bus_(bus), observer_(observer) {}
 
     bool start();
     bool read_flash(uint16_t addr, uint8_t *data, uint16_t len);
-    chsc6x_compare_status compare_flash(uint16_t addr, const uint8_t *target, uint16_t len,
+    chsc6x_compare_status compare_flash(chsc6x_update_part part, const uint8_t *target, uint16_t len,
                                         int32_t &firstDifference);
     bool write_cfg(const uint8_t *data);
     bool write_boot(const uint8_t *data, uint16_t len);
@@ -217,11 +218,19 @@ private:
     bool load_checked(uint16_t addr, const uint8_t *data, uint16_t len);
     command_result send_command(uint8_t id, uint16_t addr, uint16_t len,
                                 uint32_t checksum, uint8_t (&response)[8]);
-    chsc6x_compare_status verify_flash(uint16_t addr, const uint8_t *expected, uint16_t len);
+    chsc6x_compare_status verify_flash(uint16_t addr, const uint8_t *expected, uint16_t len,
+                                      bool finalBootReadback = false);
     bool write_block(uint16_t addr, const uint8_t *data, uint16_t len);
-    bool program(uint16_t addr, const uint8_t *data, uint16_t len);
+    bool program(chsc6x_update_part part, const uint8_t *data, uint16_t len);
+    void progress(chsc6x_update_part part, chsc6x_update_phase phase, uint32_t done, uint32_t total) const
+    {
+        if (observer_.progress) {
+            observer_.progress(part, phase, done, total);
+        }
+    }
 
     chsc6x_platform &bus_;
+    const chsc6x_update_observer &observer_;
 };
 
 bool chsc6x_burn::write_ram(uint16_t addr, const uint8_t *data, uint16_t len)
@@ -366,28 +375,33 @@ bool chsc6x_burn::read_flash(uint16_t addr, uint8_t *data, uint16_t len)
     return false;
 }
 
-chsc6x_compare_status chsc6x_burn::verify_flash(uint16_t addr, const uint8_t *expected, uint16_t len)
+chsc6x_compare_status chsc6x_burn::verify_flash(uint16_t addr, const uint8_t *expected, uint16_t len,
+                                              bool finalBootReadback)
 {
     uint8_t actual[block_size];
     auto result = chsc6x_compare_status::identical;
-    while (len > 0) {
-        const uint16_t count = len < block_size ? len : block_size;
-        if (!read_flash(addr, actual, count)) {
+    uint16_t offset = 0;
+    while (offset < len) {
+        const uint16_t remaining = len - offset;
+        const uint16_t count = remaining < block_size ? remaining : block_size;
+        if (!read_flash(addr + offset, actual, count)) {
             return chsc6x_compare_status::read_error;
         }
-        if (memcmp(actual, expected, count) != 0) {
+        if (memcmp(actual, expected + offset, count) != 0) {
             result = chsc6x_compare_status::different;
         }
-        addr += count;
-        expected += count;
-        len -= count;
+        offset += count;
+        if (finalBootReadback && result == chsc6x_compare_status::identical) {
+            progress(chsc6x_update_part::boot, chsc6x_update_phase::verify, uint32_t(len) + offset, 2UL * len);
+        }
     }
     return result;
 }
 
-chsc6x_compare_status chsc6x_burn::compare_flash(uint16_t addr, const uint8_t *target, uint16_t len,
+chsc6x_compare_status chsc6x_burn::compare_flash(chsc6x_update_part part, const uint8_t *target, uint16_t len,
                                                 int32_t &firstDifference)
 {
+    const uint16_t addr = part == chsc6x_update_part::cfg ? cfg_address : 0;
     firstDifference = -1;
     if (!target || len == 0 || uint32_t(addr) + len > 0x10000UL) {
         return chsc6x_compare_status::read_error;
@@ -395,6 +409,7 @@ chsc6x_compare_status chsc6x_burn::compare_flash(uint16_t addr, const uint8_t *t
     uint8_t actual[block_size];
     int32_t first = -1;
     uint16_t offset = 0;
+    progress(part, chsc6x_update_phase::compare, 0, len);
     while (offset < len) {
         const uint16_t remaining = len - offset;
         const uint16_t count = remaining < block_size ? remaining : block_size;
@@ -420,6 +435,7 @@ chsc6x_compare_status chsc6x_burn::compare_flash(uint16_t addr, const uint8_t *t
             }
         }
         offset += count;
+        progress(part, chsc6x_update_phase::compare, offset, len);
     }
     // Publish a difference only after the entire requested region was read reliably.
     firstDifference = first;
@@ -445,24 +461,36 @@ bool chsc6x_burn::write_block(uint16_t addr, const uint8_t *data, uint16_t len)
     return false;
 }
 
-bool chsc6x_burn::program(uint16_t addr, const uint8_t *data, uint16_t len)
+bool chsc6x_burn::program(chsc6x_update_part part, const uint8_t *data, uint16_t len)
 {
-    while (len > 0) {
-        const uint16_t count = len < block_size ? len : block_size;
-        if (!write_block(addr, data, count) ||
-            verify_flash(addr, data, count) != chsc6x_compare_status::identical) {
+    const bool boot = part == chsc6x_update_part::boot;
+    const uint16_t base = boot ? 0 : cfg_address;
+    const uint32_t writeTotal = boot ? uint32_t(len) + 1 : len;
+    const uint32_t verifyTotal = boot ? 2UL * len : len;
+    uint16_t offset = 0;
+    progress(part, chsc6x_update_phase::write, 0, writeTotal);
+    while (offset < len) {
+        const uint16_t remaining = len - offset;
+        const uint16_t count = remaining < block_size ? remaining : block_size;
+        if (!write_block(base + offset, data + offset, count)) {
             return false;
         }
-        addr += count;
-        data += count;
-        len -= count;
+        progress(part, chsc6x_update_phase::write, offset + count, writeTotal);
+        if (offset == 0) {
+            progress(part, chsc6x_update_phase::verify, 0, verifyTotal);
+        }
+        if (verify_flash(base + offset, data + offset, count) != chsc6x_compare_status::identical) {
+            return false;
+        }
+        offset += count;
+        progress(part, chsc6x_update_phase::verify, offset, verifyTotal);
     }
     return true;
 }
 
 bool chsc6x_burn::write_cfg(const uint8_t *data)
 {
-    return data && program(cfg_address, data, sizeof(chsc6x_cfg::bytes));
+    return data && program(chsc6x_update_part::cfg, data, sizeof(chsc6x_cfg::bytes));
 }
 
 bool chsc6x_burn::write_boot(const uint8_t *data, uint16_t len)
@@ -471,8 +499,12 @@ bool chsc6x_burn::write_boot(const uint8_t *data, uint16_t len)
         return false;
     }
     // The vendor writes the complete image, then programs byte 8 again.
-    return program(0, data, len) && write_block(8, data + 8, 1) &&
-           verify_flash(0, data, len) == chsc6x_compare_status::identical;
+    if (!program(chsc6x_update_part::boot, data, len) || !write_block(8, data + 8, 1)) {
+        return false;
+    }
+    const uint32_t writeTotal = uint32_t(len) + 1;
+    progress(chsc6x_update_part::boot, chsc6x_update_phase::write, writeTotal, writeTotal);
+    return verify_flash(0, data, len, true) == chsc6x_compare_status::identical;
 }
 
 bool read_probe_register(chsc6x_platform &bus, uint16_t address, uint8_t *data, uint16_t length)
@@ -494,7 +526,7 @@ bool select_parts(uint32_t identity, const UpdateImage &image, chsc6x_update_res
     return cfg || boot;
 }
 
-bool compare_part(chsc6x_burn &burner, uint16_t address, const uint8_t *data, uint16_t length,
+bool compare_part(chsc6x_burn &burner, chsc6x_update_part component, const uint8_t *data, uint16_t length,
                   bool force, chsc6x_part_result &part)
 {
     if (part.comparison == chsc6x_compare_status::not_applicable) {
@@ -504,7 +536,7 @@ bool compare_part(chsc6x_burn &burner, uint16_t address, const uint8_t *data, ui
         part.comparison = chsc6x_compare_status::forced;
         return true;
     }
-    part.comparison = burner.compare_flash(address, data, length, part.first_difference);
+    part.comparison = burner.compare_flash(component, data, length, part.first_difference);
     return part.comparison == chsc6x_compare_status::identical ||
            part.comparison == chsc6x_compare_status::different;
 }
@@ -520,11 +552,11 @@ bool sync_parts(chsc6x_burn &burner, const UpdateImage &image, chsc6x_update_res
 {
     const bool force = report.force_reason != nullptr;
     init.stage = "compare_cfg";
-    if (!compare_part(burner, cfg_address, image.cfg, sizeof(chsc6x_cfg::bytes), force, report.cfg)) {
+    if (!compare_part(burner, chsc6x_update_part::cfg, image.cfg, sizeof(chsc6x_cfg::bytes), force, report.cfg)) {
         return false;
     }
     init.stage = "compare_boot";
-    if (!compare_part(burner, 0, image.boot, image.boot_size, force, report.boot)) {
+    if (!compare_part(burner, chsc6x_update_part::boot, image.boot, image.boot_size, force, report.boot)) {
         return false;
     }
 
@@ -549,13 +581,19 @@ bool sync_parts(chsc6x_burn &burner, const UpdateImage &image, chsc6x_update_res
 
 chsc6x_update_result chsc6x_updater::run(chsc6x &touch, const uint8_t *package, size_t length)
 {
+    return run(touch, package, length, {});
+}
+
+chsc6x_update_result chsc6x_updater::run(chsc6x &touch, const uint8_t *package, size_t length,
+                                        const chsc6x_update_observer &observer)
+{
     chsc6x_update_result report;
-    report.init = maintain(touch, package, length, report);
+    report.init = maintain(touch, package, length, report, observer);
     return report;
 }
 
 chsc6x_init_result chsc6x_updater::maintain(chsc6x &touch, const uint8_t *package, size_t length,
-                                           chsc6x_update_result &report)
+                                           chsc6x_update_result &report, const chsc6x_update_observer &observer)
 {
     using probe = chsc6x::probe_state;
     UpdateImage image;
@@ -611,7 +649,13 @@ chsc6x_init_result chsc6x_updater::maintain(chsc6x &touch, const uint8_t *packag
         }
     }
 
-    chsc6x_burn burner(touch);
+    if (observer.begin && !observer.begin()) {
+        touch.restore_touch_mode(state == probe::running || state == probe::cfg_invalid);
+        init.status = chsc6x_init_status::error;
+        init.stage = "display_init";
+        return init;
+    }
+    chsc6x_burn burner(touch, observer);
     init.stage = "load_helper";
     bool ok = burner.start();
     if (ok && state != probe::running) {
