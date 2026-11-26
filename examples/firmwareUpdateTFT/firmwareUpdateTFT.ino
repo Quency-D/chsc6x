@@ -1,15 +1,20 @@
-// Heltec V4R8 with TouchTFT V0.2. Install LovyanGFX for this example.
+// Select Heltec WiFi LoRa 32(V4) or Heltec WiFi LoRa 32(V4 R8) to match the board with a TFT.
+// Requires LovyanGFX.
 // A differing component is replaced even when the controller has a newer version.
 #include <chsc6x_update.h>
-#include <firmware/firmware_05_12_V224_V4.h>
-#include "v4r8_tft_display.h"
+#include "heltec_tft_display.h"
 
-constexpr int panelPower = 40; // Active low.
-constexpr int sdChipSelect = 3;
-constexpr int touchSda = 17;
-constexpr int touchScl = 18;
-chsc6x controller(&Wire1, touchSda, touchScl, -1, V4R8Display::SHARED_RESET_PIN, true);
-V4R8Display tft;
+#if defined(WIFI_LORA_32_V4) && !defined(WIFI_LORA_32_V4_R8)
+#include <firmware/firmware_01_01_V224_V4.h>
+static constexpr auto &panelFirmware = fw_file_tlsc6x_01_01;
+#else
+#include <firmware/firmware_05_12_V224_V4.h>
+static constexpr auto &panelFirmware = fw_file_tlsc6x_05_12;
+#endif
+
+chsc6x controller(&Wire1, heltec_tft::touchSda, heltec_tft::touchScl, -1,
+                  heltec_tft::touchReset, heltec_tft::sharedReset);
+heltec_tft::Display tft;
 static bool displayReady = false;
 // Rows are cfg and boot. Columns are compare, write and verify.
 static int percentages[2][3] = {{-1, -1, -1}, {-1, -1, -1}};
@@ -28,7 +33,12 @@ static void drawPercentage(int part, int phase)
 
 static bool openDisplay()
 {
-    displayReady = tft.init_without_reset(true);
+    // On V4, pulse the dedicated TFT reset on first use. On R8 the updater owns GPIO21.
+    if (!displayReady && !heltec_tft::sharedReset) {
+        displayReady = tft.init();
+    } else {
+        displayReady = tft.init_without_reset(true);
+    }
     if (!displayReady) {
         return false;
     }
@@ -51,7 +61,6 @@ static bool openDisplay()
 
 static bool beginUpdate()
 {
-    // The updater has already released the shared reset. Leave it high.
     if (!openDisplay()) {
         Serial.print("TFT initialization failed. Stopping before flash writes.\r\n");
         return false;
@@ -91,7 +100,6 @@ static const char *comparisonName(chsc6x_compare_status status)
     switch (status) {
     case chsc6x_compare_status::identical:          return "identical";
     case chsc6x_compare_status::different:          return "different";
-    case chsc6x_compare_status::forced:             return "forced recovery";
     case chsc6x_compare_status::not_applicable:     return "not applicable";
     case chsc6x_compare_status::read_error:         return "read failed";
     case chsc6x_compare_status::inconsistent_reads: return "unreliable reads";
@@ -133,30 +141,33 @@ static void showVersions(int y, const char *label, const chsc6x_versions &v, boo
 void setup()
 {
     Serial.begin(115200);
-    pinMode(sdChipSelect, OUTPUT);
-    digitalWrite(sdChipSelect, HIGH);
-    pinMode(panelPower, OUTPUT);
-    digitalWrite(panelPower, LOW);
+    if (heltec_tft::sdChipSelect >= 0) {
+        pinMode(heltec_tft::sdChipSelect, OUTPUT);
+        digitalWrite(heltec_tft::sdChipSelect, HIGH);
+    }
+    pinMode(Vext, OUTPUT);
+    digitalWrite(Vext, LOW); // Active low on both variants.
     delay(1000); // Allow the panel supply to settle before probing the controller.
 
     const chsc6x_update_observer observer = {beginUpdate, showProgress};
-    const auto result = chsc6x_updater::run(controller, fw_file_tlsc6x_05_12,
-                                           sizeof(fw_file_tlsc6x_05_12), observer);
-    // Maintenance can reset both chips before returning. Repaint without pulsing RST.
+    const auto result = chsc6x_updater::run(controller, panelFirmware, sizeof(panelFirmware), observer);
+    // On R8 the final touch reset also resets the TFT. Repaint the result on either board.
     if (!openDisplay()) {
         Serial.print("TFT result screen unavailable.\r\n");
     }
     const auto &init = result.init;
-    resultLine(148, resultName(init.status), 2);
+    if (result.running_data_invalid) {
+        resultLine(148, "Invalid running data. Update skipped.", 1);
+    } else {
+        resultLine(148, resultName(init.status), 2);
+    }
     showPart(176, "cfg", result.cfg, init.cfg_written);
     showPart(190, "boot", result.boot, init.boot_written);
     resultLine(204, init.stage, 1);
     showVersions(222, "Before", init.before, init.before_valid);
     showVersions(244, "Package", result.target, result.target.boot != 0);
     showVersions(266, "After", init.after, init.after_valid);
-    if (result.force_reason) {
-        resultLine(292, result.force_reason, 1);
-    } else if (result.cfg_reads_inconsistent || result.boot_reads_inconsistent) {
+    if (result.cfg_reads_inconsistent || result.boot_reads_inconsistent) {
         resultLine(292, "Unreliable controller reads", 1);
     }
     if (init.needs_power_cycle) {

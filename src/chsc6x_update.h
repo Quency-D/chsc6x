@@ -2,6 +2,7 @@
 
 #include "chsc6x.h"
 
+// The legacy forced value is reserved; the updater only writes confirmed differences.
 enum class chsc6x_compare_status {
     not_checked, not_applicable, identical, different, forced, read_error, inconsistent_reads
 };
@@ -18,10 +19,12 @@ struct chsc6x_update_result {
     chsc6x_versions target{};
     chsc6x_part_result cfg;
     chsc6x_part_result boot;
+    // Retained for existing callers; forced recovery is disabled.
     const char *force_reason = nullptr;
     bool assumed_panel = false;
     bool cfg_reads_inconsistent = false;
     bool boot_reads_inconsistent = false;
+    bool running_data_invalid = false;
 };
 
 enum class chsc6x_update_part { cfg, boot };
@@ -38,7 +41,7 @@ struct chsc6x_update_observer {
 
 class chsc6x_updater {
 public:
-    // Explicit maintenance operation. A compatible package may replace newer firmware.
+    // Requires valid running firmware and cfg. A compatible package may replace newer firmware.
     static chsc6x_update_result run(chsc6x &touch, const uint8_t *package, size_t length);
     static chsc6x_update_result run(chsc6x &touch, const uint8_t *package, size_t length,
                                     const chsc6x_update_observer &observer);

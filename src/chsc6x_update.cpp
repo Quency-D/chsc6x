@@ -204,7 +204,6 @@ public:
         : bus_(bus), observer_(observer) {}
 
     bool start();
-    bool read_flash(uint16_t addr, uint8_t *data, uint16_t len);
     chsc6x_compare_status compare_flash(chsc6x_update_part part, const uint8_t *target, uint16_t len,
                                         int32_t &firstDifference);
     bool write_cfg(const uint8_t *data);
@@ -213,6 +212,7 @@ public:
 private:
     enum class command_result { ok, retry, stop };
 
+    bool read_flash(uint16_t addr, uint8_t *data, uint16_t len);
     bool write_ram(uint16_t addr, const uint8_t *data, uint16_t len);
     bool matches_ram(uint16_t addr, const uint8_t *data, uint16_t len);
     bool load_checked(uint16_t addr, const uint8_t *data, uint16_t len);
@@ -527,13 +527,9 @@ bool select_parts(uint32_t identity, const UpdateImage &image, chsc6x_update_res
 }
 
 bool compare_part(chsc6x_burn &burner, chsc6x_update_part component, const uint8_t *data, uint16_t length,
-                  bool force, chsc6x_part_result &part)
+                  chsc6x_part_result &part)
 {
     if (part.comparison == chsc6x_compare_status::not_applicable) {
-        return true;
-    }
-    if (force) {
-        part.comparison = chsc6x_compare_status::forced;
         return true;
     }
     part.comparison = burner.compare_flash(component, data, length, part.first_difference);
@@ -541,26 +537,19 @@ bool compare_part(chsc6x_burn &burner, chsc6x_update_part component, const uint8
            part.comparison == chsc6x_compare_status::different;
 }
 
-bool needs_write(const chsc6x_part_result &part)
-{
-    return part.comparison == chsc6x_compare_status::different ||
-           part.comparison == chsc6x_compare_status::forced;
-}
-
 bool sync_parts(chsc6x_burn &burner, const UpdateImage &image, chsc6x_update_result &report,
                 chsc6x_init_result &init)
 {
-    const bool force = report.force_reason != nullptr;
     init.stage = "compare_cfg";
-    if (!compare_part(burner, chsc6x_update_part::cfg, image.cfg, sizeof(chsc6x_cfg::bytes), force, report.cfg)) {
+    if (!compare_part(burner, chsc6x_update_part::cfg, image.cfg, sizeof(chsc6x_cfg::bytes), report.cfg)) {
         return false;
     }
     init.stage = "compare_boot";
-    if (!compare_part(burner, chsc6x_update_part::boot, image.boot, image.boot_size, force, report.boot)) {
+    if (!compare_part(burner, chsc6x_update_part::boot, image.boot, image.boot_size, report.boot)) {
         return false;
     }
 
-    if (needs_write(report.cfg)) {
+    if (report.cfg.comparison == chsc6x_compare_status::different) {
         init.stage = "cfg_write_verify";
         report.cfg.write_attempted = true;
         init.cfg_written = burner.write_cfg(image.cfg);
@@ -568,7 +557,7 @@ bool sync_parts(chsc6x_burn &burner, const UpdateImage &image, chsc6x_update_res
             return false;
         }
     }
-    if (needs_write(report.boot)) {
+    if (report.boot.comparison == chsc6x_compare_status::different) {
         init.stage = "boot_write_verify";
         report.boot.write_attempted = true;
         init.boot_written = burner.write_boot(image.boot, image.boot_size);
@@ -616,80 +605,30 @@ chsc6x_init_result chsc6x_updater::maintain(chsc6x &touch, const uint8_t *packag
     if (state == probe::blocked) {
         return init;
     }
-    const bool repairable = state == probe::cfg_invalid || state == probe::boot_invalid ||
-                            state == probe::unknown_header;
-    if (readFault || (state != probe::running && !repairable)) {
+    if (readFault || state != probe::running) {
         report.cfg_reads_inconsistent = state == probe::cfg_inconsistent;
+        report.running_data_invalid = state == probe::cfg_invalid || state == probe::boot_invalid ||
+                                      state == probe::unknown_header;
         touch.restore_touch_mode(state == probe::running || state == probe::cfg_invalid ||
                                  state == probe::cfg_unreadable || report.cfg_reads_inconsistent);
         return init;
     }
-
-    if (state == probe::running) {
-        if (!select_parts(identity, image, report)) {
-            init.status = chsc6x_init_status::incompatible;
-            init.stage = "panel_identity";
-            touch.restore_touch_mode(true);
-            return init;
-        }
-    } else if (state == probe::unknown_header) {
-        // Vendor fallback for an empty/corrupt boot header. An I2C ACK alone is insufficient.
-        uint8_t rom[3];
-        if (!read_probe_register(touch, 0x0009, rom, sizeof(rom))) {
-            init.stage = "read_rom_id";
-            touch.restore_touch_mode(false);
-            return init;
-        }
-        const uint32_t id = le16(rom) | (uint32_t(rom[2]) << 16);
-        if (id != 0x444240 && id != 0x5C5C5C) {
-            init.status = chsc6x_init_status::incompatible;
-            init.stage = "chip_family";
-            touch.restore_touch_mode(false);
-            return init;
-        }
+    if (!select_parts(identity, image, report)) {
+        init.status = chsc6x_init_status::incompatible;
+        init.stage = "panel_identity";
+        touch.restore_touch_mode(true);
+        return init;
     }
 
     if (observer.begin && !observer.begin()) {
-        touch.restore_touch_mode(state == probe::running || state == probe::cfg_invalid);
+        touch.restore_touch_mode(true);
         init.status = chsc6x_init_status::error;
         init.stage = "display_init";
         return init;
     }
     chsc6x_burn burner(touch, observer);
     init.stage = "load_helper";
-    bool ok = burner.start();
-    if (ok && state != probe::running) {
-        chsc6x_cfg factory;
-        init.stage = "read_factory_cfg";
-        ok = burner.read_flash(0xF000, factory.bytes, sizeof(factory.bytes));
-        if (ok && !chsc6x::valid_cfg(factory, touch._i2c_addr)) {
-            // An invalid factory cfg can override panel identification only if it is repeatable.
-            chsc6x_cfg &previousCfg = evidence.first_bad_cfg;
-            for (int attempt = 1; ok && attempt < TP_RETRY_CNT2; ++attempt) {
-                ok = burner.read_flash(0xF000, previousCfg.bytes, sizeof(previousCfg.bytes));
-                if (ok && memcmp(factory.bytes, previousCfg.bytes, sizeof(factory.bytes)) != 0) {
-                    report.cfg_reads_inconsistent = true;
-                    init.stage = "cfg_read_unreliable";
-                    chsc6x_err("CHSC6X: factory cfg reads disagree\r\n");
-                    ok = false;
-                }
-            }
-            report.assumed_panel = ok;
-        }
-        if (ok) {
-            identity = report.assumed_panel ? image.cfg_identity : (le32(factory.bytes) & cfgIdentityMask);
-            ok = select_parts(identity, image, report);
-            if (ok) {
-                report.force_reason = state == probe::cfg_invalid ? "invalid running cfg" : "invalid boot header";
-            } else {
-                init.status = chsc6x_init_status::incompatible;
-                init.stage = "factory_panel_identity";
-            }
-        }
-    }
-    if (ok) {
-        ok = sync_parts(burner, image, report, init);
-    }
+    const bool ok = burner.start() && sync_parts(burner, image, report, init);
 
     // Even a read-only comparison runs the helper in place of normal touch firmware.
     const bool wrote = init.cfg_written || init.boot_written;
@@ -731,7 +670,7 @@ chsc6x_init_result chsc6x_updater::maintain(chsc6x &touch, const uint8_t *packag
     if (ok) {
         const bool cfgApplicable = report.cfg.comparison != chsc6x_compare_status::not_applicable;
         const bool cfgOk = cfgApplicable ? init.after.cfg == image.versions.cfg
-                                         : !init.before_valid || init.after.cfg == init.before.cfg;
+                                         : init.after.cfg == init.before.cfg;
         if (init.after_valid && afterIdentity == identity && cfgOk && init.after.boot == image.versions.boot) {
             init.status = wrote ? chsc6x_init_status::updated : chsc6x_init_status::current;
             init.stage = wrote ? "verified" : "identical";

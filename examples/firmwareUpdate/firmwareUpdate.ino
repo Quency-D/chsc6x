@@ -1,13 +1,24 @@
 #include <chsc6x_update.h>
-#include <firmware/firmware_05_12_V224_V4.h>
 
-// Heltec V4R8 with TouchTFT V0.2. Change these settings for another board.
+#if defined(WIFI_LORA_32_V4) && !defined(WIFI_LORA_32_V4_R8)
+#include <firmware/firmware_01_01_V224_V4.h>
+static constexpr auto &panelFirmware = fw_file_tlsc6x_01_01;
+constexpr int touchSda = 47;
+constexpr int touchScl = 48;
+constexpr int touchReset = 44;
+constexpr int panelPower = 36;
+constexpr bool resetSharedWithTft = false;
+#else
+// V4R8 with TouchTFT V0.2. Adjust these defaults for other boards.
+#include <firmware/firmware_05_12_V224_V4.h>
+static constexpr auto &panelFirmware = fw_file_tlsc6x_05_12;
 constexpr int touchSda = 17;
 constexpr int touchScl = 18;
-constexpr int touchInt = -1;
 constexpr int touchReset = 21;
 constexpr int panelPower = 40;  // active low; use -1 for an always-powered panel
 constexpr bool resetSharedWithTft = true;
+#endif
+constexpr int touchInt = -1;
 chsc6x touch(&Wire1, touchSda, touchScl, touchInt, touchReset,
              resetSharedWithTft);
 static const char *touchReminder = nullptr;
@@ -19,12 +30,11 @@ static const char *comparisonName(chsc6x_compare_status value)
     case chsc6x_compare_status::not_applicable: return "not applicable";
     case chsc6x_compare_status::identical:      return "identical";
     case chsc6x_compare_status::different:      return "different";
-    case chsc6x_compare_status::forced:         return "forced";
     case chsc6x_compare_status::read_error:     return "flash read failed. Update skipped.";
     case chsc6x_compare_status::inconsistent_reads:
         return "unreliable flash reads: two reads of the same block differ. Update skipped.";
+    default: return "unknown";
     }
-    return "unknown";
 }
 
 static const char *statusName(chsc6x_init_status status)
@@ -69,19 +79,14 @@ void setup()
     }
 
     Serial.print("CHSC6X update may install an older firmware version.\r\n");
-    const auto result = chsc6x_updater::run(touch, fw_file_tlsc6x_05_12, sizeof(fw_file_tlsc6x_05_12));
+    const auto result = chsc6x_updater::run(touch, panelFirmware, sizeof(panelFirmware));
     const auto &init = result.init;
     printVersions("Old (controller before maintenance)", init.before, init.before_valid);
     printVersions("New (package target)", result.target, result.target.boot != 0);
-    if (result.force_reason) {
-        Serial.printf("Recovery reason: %s\r\n", result.force_reason);
-    }
-    if (result.assumed_panel) {
-        Serial.print("Factory cfg invalid; using the target panel selected by this sketch.\r\n");
-    }
     printPart("cfg", result.cfg, init.cfg_written);
     printPart("boot", result.boot, init.boot_written);
-    Serial.printf("Result: %s, stage=%s, touch_ready=%u\r\n", statusName(init.status), init.stage, unsigned(init.touch_ready));
+    const char *status = result.running_data_invalid ? "Invalid running data. Update skipped." : statusName(init.status);
+    Serial.printf("Result: %s, stage=%s, touch_ready=%u\r\n", status, init.stage, unsigned(init.touch_ready));
     if (result.cfg_reads_inconsistent) {
         Serial.print("Unreliable cfg reads: repeated snapshots differ. Update skipped.\r\n");
     }
