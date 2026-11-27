@@ -2,15 +2,8 @@
 // Requires LovyanGFX.
 // A differing component is replaced even when the controller has a newer version.
 #include <chsc6x_update.h>
+#include <firmware/panel_packages.h>
 #include "heltec_tft_display.h"
-
-#if defined(WIFI_LORA_32_V4) && !defined(WIFI_LORA_32_V4_R8)
-#include <firmware/firmware_01_01_V224_V4.h>
-static constexpr auto &panelFirmware = fw_file_tlsc6x_01_01;
-#else
-#include <firmware/firmware_05_12_V224_V4.h>
-static constexpr auto &panelFirmware = fw_file_tlsc6x_05_12;
-#endif
 
 chsc6x controller(&Wire1, heltec_tft::touchSda, heltec_tft::touchScl, -1,
                   heltec_tft::touchReset, heltec_tft::sharedReset);
@@ -116,6 +109,13 @@ static void resultLine(int y, const char *text, int size)
     }
 }
 
+static void showIdentity(int y, const char *label, uint32_t identity)
+{
+    char line[40];
+    snprintf(line, sizeof(line), "%s 0x%08lX", label, static_cast<unsigned long>(identity));
+    resultLine(y, line, 1);
+}
+
 static void showPart(int y, const char *name, const chsc6x_part_result &part, bool written)
 {
     const char *action = "skipped";
@@ -150,25 +150,49 @@ void setup()
     delay(1000); // Allow the panel supply to settle before probing the controller.
 
     const chsc6x_update_observer observer = {beginUpdate, showProgress};
-    const auto result = chsc6x_updater::run(controller, panelFirmware, sizeof(panelFirmware), observer);
+    const auto result = chsc6x_updater::run_auto(controller, chsc6x_firmware::packages,
+                                                 chsc6x_firmware::count, observer);
     // On R8 the final touch reset also resets the TFT. Repaint the result on either board.
     if (!openDisplay()) {
         Serial.print("TFT result screen unavailable.\r\n");
     }
     const auto &init = result.init;
-    if (result.running_data_invalid) {
-        resultLine(148, "Invalid running data. Update skipped.", 1);
-    } else {
-        resultLine(148, resultName(init.status), 2);
+    char line[48] = "VID/PID --  Pkg --";
+    if (result.vendor_id >= 0) {
+        snprintf(line, sizeof(line), "VID/PID %d/%d  Pkg %s", result.vendor_id, result.project_id,
+                 result.package_name ? result.package_name : "--");
     }
-    showPart(176, "cfg", result.cfg, init.cfg_written);
-    showPart(190, "boot", result.boot, init.boot_written);
-    resultLine(204, init.stage, 1);
-    showVersions(222, "Before", init.before, init.before_valid);
-    showVersions(244, "Package", result.target, result.target.boot != 0);
-    showVersions(266, "After", init.after, init.after_valid);
+    resultLine(132, line, 1);
+    if (result.cfg.comparison == chsc6x_compare_status::not_applicable) {
+        showIdentity(142, "Panel ID", result.panel_identity);
+        showIdentity(152, "Package cfg ID", result.package_cfg_identity);
+        showIdentity(162, "Package boot match", result.package_boot_match);
+        resultLine(172, result.boot_only() ? "Cfg ID mismatch: boot only"
+                                           : "Neither cfg nor boot matches. Skipped.", 1);
+    } else if (result.vendor_id >= 0 && result.target.boot == 0) {
+        showIdentity(142, "Panel ID", result.panel_identity);
+        resultLine(152, "Package cfg ID --", 1);
+        resultLine(162, "Package boot match --", 1);
+    }
+    if (result.running_data_invalid) {
+        resultLine(183, "Invalid running data. Update skipped.", 1);
+    } else {
+        resultLine(183, resultName(init.status), 2);
+    }
+    showPart(201, "cfg", result.cfg, init.cfg_written);
+    showPart(211, "boot", result.boot, init.boot_written);
+    resultLine(221, init.stage, 1);
+    const auto &failed = result.cfg.failure_step ? result.cfg : result.boot;
+    if (failed.failure_step) {
+        snprintf(line, sizeof(line), "FAIL %s: %s +0x%04X", result.cfg.failure_step ? "cfg" : "boot",
+                 failed.failure_step, unsigned(failed.failure_offset));
+        resultLine(231, line, 1);
+    }
+    showVersions(241, "Before", init.before, init.before_valid);
+    showVersions(259, "Package", result.target, result.target.boot != 0);
+    showVersions(277, "After", init.after, init.after_valid);
     if (result.cfg_reads_inconsistent || result.boot_reads_inconsistent) {
-        resultLine(292, "Unreliable controller reads", 1);
+        resultLine(295, "Unreliable controller reads", 1);
     }
     if (init.needs_power_cycle) {
         resultLine(306, "Power-cycle the touch controller", 1);

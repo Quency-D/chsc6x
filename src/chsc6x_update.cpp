@@ -27,6 +27,9 @@ constexpr uint32_t cfgIdentityMask = 0x03FFFFFF;
 constexpr uint32_t bootIdentityMask = 0x00FFFFFF;
 
 // This vendor package contains one match entry, one cfg and one boot image.
+constexpr size_t cfgOffset = 24 + 4;
+constexpr size_t bootOffset = cfgOffset + sizeof(chsc6x_cfg::bytes);
+
 struct UpdateImage {
     const uint8_t *cfg;
     const uint8_t *boot;
@@ -36,10 +39,19 @@ struct UpdateImage {
     chsc6x_versions versions;
 };
 
-bool open_image(const uint8_t *p, size_t length, UpdateImage &image)
+UpdateImage image_contents(const chsc6x_update_package &package)
 {
-    constexpr size_t cfgOffset = 24 + 4;
-    constexpr size_t bootOffset = cfgOffset + sizeof(chsc6x_cfg::bytes);
+    const uint8_t *cfg = package.data + cfgOffset;
+    const uint8_t *boot = package.data + bootOffset;
+    return {cfg, boot, static_cast<uint16_t>(package.length - bootOffset),
+            le32(cfg) & cfgIdentityMask, le32(package.data + 24),
+            {static_cast<uint8_t>(cfg[3] >> 2), le16(boot + 4)}};
+}
+
+bool valid_package(const chsc6x_update_package &package)
+{
+    const uint8_t *p = package.data;
+    const size_t length = package.length;
     // Header, one match word, one cfg, then a boot with its own header and checksum.
     if (!p || length < bootOffset + 16 || length - bootOffset > 0x8000) {
         return false;
@@ -48,13 +60,7 @@ bool open_image(const uint8_t *p, size_t length, UpdateImage &image)
         le32(p + 16) != sizeof(chsc6x_cfg::bytes) || le32(p + 20) != length - bootOffset) {
         return false;
     }
-    image.cfg = p + cfgOffset;
-    image.boot = p + bootOffset;
-    image.boot_size = static_cast<uint16_t>(length - bootOffset);
-    image.cfg_identity = le32(image.cfg) & cfgIdentityMask;
-    image.boot_match = le32(p + 24);
-    image.versions.cfg = image.cfg[3] >> 2;
-    image.versions.boot = le16(image.boot + 4);
+    const UpdateImage image = image_contents(package);
     const size_t body = image.boot_size - 4;
     return image.boot_match == (image.cfg_identity & bootIdentityMask) &&
            image.cfg[106] == (CHSC6X_I2C_ID << 1) && sum16(image.cfg, sizeof(chsc6x_cfg::bytes)) == 0 &&
@@ -206,8 +212,8 @@ public:
     bool start();
     chsc6x_compare_status compare_flash(chsc6x_update_part part, const uint8_t *target, uint16_t len,
                                         int32_t &firstDifference);
-    bool write_cfg(const uint8_t *data);
-    bool write_boot(const uint8_t *data, uint16_t len);
+    bool write_cfg(const uint8_t *data, chsc6x_part_result &part);
+    bool write_boot(const uint8_t *data, uint16_t len, chsc6x_part_result &part);
 
 private:
     enum class command_result { ok, retry, stop };
@@ -219,9 +225,9 @@ private:
     command_result send_command(uint8_t id, uint16_t addr, uint16_t len,
                                 uint32_t checksum, uint8_t (&response)[8]);
     chsc6x_compare_status verify_flash(uint16_t addr, const uint8_t *expected, uint16_t len,
-                                      bool finalBootReadback = false);
+                                      bool finalBootReadback = false, uint16_t *failureOffset = nullptr);
     bool write_block(uint16_t addr, const uint8_t *data, uint16_t len);
-    bool program(chsc6x_update_part part, const uint8_t *data, uint16_t len);
+    bool program(chsc6x_update_part part, const uint8_t *data, uint16_t len, chsc6x_part_result &diagnostic);
     void progress(chsc6x_update_part part, chsc6x_update_phase phase, uint32_t done, uint32_t total) const
     {
         if (observer_.progress) {
@@ -376,7 +382,7 @@ bool chsc6x_burn::read_flash(uint16_t addr, uint8_t *data, uint16_t len)
 }
 
 chsc6x_compare_status chsc6x_burn::verify_flash(uint16_t addr, const uint8_t *expected, uint16_t len,
-                                              bool finalBootReadback)
+                                               bool finalBootReadback, uint16_t *failureOffset)
 {
     uint8_t actual[block_size];
     auto result = chsc6x_compare_status::identical;
@@ -385,9 +391,19 @@ chsc6x_compare_status chsc6x_burn::verify_flash(uint16_t addr, const uint8_t *ex
         const uint16_t remaining = len - offset;
         const uint16_t count = remaining < block_size ? remaining : block_size;
         if (!read_flash(addr + offset, actual, count)) {
+            if (failureOffset) {
+                *failureOffset = offset;
+            }
             return chsc6x_compare_status::read_error;
         }
         if (memcmp(actual, expected + offset, count) != 0) {
+            if (failureOffset && result == chsc6x_compare_status::identical) {
+                uint16_t i = 0;
+                while (i < count && actual[i] == expected[offset + i]) {
+                    ++i;
+                }
+                *failureOffset = offset + i;
+            }
             result = chsc6x_compare_status::different;
         }
         offset += count;
@@ -461,7 +477,8 @@ bool chsc6x_burn::write_block(uint16_t addr, const uint8_t *data, uint16_t len)
     return false;
 }
 
-bool chsc6x_burn::program(chsc6x_update_part part, const uint8_t *data, uint16_t len)
+bool chsc6x_burn::program(chsc6x_update_part part, const uint8_t *data, uint16_t len,
+                         chsc6x_part_result &diagnostic)
 {
     const bool boot = part == chsc6x_update_part::boot;
     const uint16_t base = boot ? 0 : cfg_address;
@@ -473,13 +490,19 @@ bool chsc6x_burn::program(chsc6x_update_part part, const uint8_t *data, uint16_t
         const uint16_t remaining = len - offset;
         const uint16_t count = remaining < block_size ? remaining : block_size;
         if (!write_block(base + offset, data + offset, count)) {
+            diagnostic.failure_step = "write block";
+            diagnostic.failure_offset = offset;
             return false;
         }
         progress(part, chsc6x_update_phase::write, offset + count, writeTotal);
         if (offset == 0) {
             progress(part, chsc6x_update_phase::verify, 0, verifyTotal);
         }
-        if (verify_flash(base + offset, data + offset, count) != chsc6x_compare_status::identical) {
+        uint16_t withinBlock = 0;
+        const auto verified = verify_flash(base + offset, data + offset, count, false, &withinBlock);
+        if (verified != chsc6x_compare_status::identical) {
+            diagnostic.failure_step = verified == chsc6x_compare_status::read_error ? "verify read block" : "verify mismatch";
+            diagnostic.failure_offset = offset + withinBlock;
             return false;
         }
         offset += count;
@@ -488,23 +511,33 @@ bool chsc6x_burn::program(chsc6x_update_part part, const uint8_t *data, uint16_t
     return true;
 }
 
-bool chsc6x_burn::write_cfg(const uint8_t *data)
+bool chsc6x_burn::write_cfg(const uint8_t *data, chsc6x_part_result &part)
 {
-    return data && program(chsc6x_update_part::cfg, data, sizeof(chsc6x_cfg::bytes));
+    return data && program(chsc6x_update_part::cfg, data, sizeof(chsc6x_cfg::bytes), part);
 }
 
-bool chsc6x_burn::write_boot(const uint8_t *data, uint16_t len)
+bool chsc6x_burn::write_boot(const uint8_t *data, uint16_t len, chsc6x_part_result &part)
 {
     if (!data || len <= 8 || len > cfg_address || data[8] != 0x4B) {
         return false;
     }
     // The vendor writes the complete image, then programs byte 8 again.
-    if (!program(chsc6x_update_part::boot, data, len) || !write_block(8, data + 8, 1)) {
+    if (!program(chsc6x_update_part::boot, data, len, part)) {
+        return false;
+    }
+    if (!write_block(8, data + 8, 1)) {
+        part.failure_step = "signature write";
+        part.failure_offset = 8;
         return false;
     }
     const uint32_t writeTotal = uint32_t(len) + 1;
     progress(chsc6x_update_part::boot, chsc6x_update_phase::write, writeTotal, writeTotal);
-    return verify_flash(0, data, len, true) == chsc6x_compare_status::identical;
+    const auto verified = verify_flash(0, data, len, true, &part.failure_offset);
+    if (verified != chsc6x_compare_status::identical) {
+        part.failure_step = verified == chsc6x_compare_status::read_error ? "final read block" : "final mismatch";
+        return false;
+    }
+    return true;
 }
 
 bool read_probe_register(chsc6x_platform &bus, uint16_t address, uint8_t *data, uint16_t length)
@@ -519,11 +552,24 @@ bool read_probe_register(chsc6x_platform &bus, uint16_t address, uint8_t *data, 
 
 bool select_parts(uint32_t identity, const UpdateImage &image, chsc6x_update_result &report)
 {
+    report.package_cfg_identity = image.cfg_identity;
+    report.package_boot_match = image.boot_match;
     const bool cfg = identity == image.cfg_identity;
     const bool boot = (identity & bootIdentityMask) == image.boot_match;
     report.cfg.comparison = cfg ? chsc6x_compare_status::not_checked : chsc6x_compare_status::not_applicable;
     report.boot.comparison = boot ? chsc6x_compare_status::not_checked : chsc6x_compare_status::not_applicable;
     return cfg || boot;
+}
+
+// Chipsemi encodes the upper two bits of each ID separately in the cfg word.
+int16_t vendor_id(uint32_t identity)
+{
+    return ((identity >> 9) & 0x7F) | (((identity >> 22) & 3) << 7);
+}
+
+int16_t project_id(uint32_t identity)
+{
+    return (identity & 0x01FF) | (((identity >> 20) & 3) << 9);
 }
 
 bool compare_part(chsc6x_burn &burner, chsc6x_update_part component, const uint8_t *data, uint16_t length,
@@ -552,7 +598,7 @@ bool sync_parts(chsc6x_burn &burner, const UpdateImage &image, chsc6x_update_res
     if (report.cfg.comparison == chsc6x_compare_status::different) {
         init.stage = "cfg_write_verify";
         report.cfg.write_attempted = true;
-        init.cfg_written = burner.write_cfg(image.cfg);
+        init.cfg_written = burner.write_cfg(image.cfg, report.cfg);
         if (!init.cfg_written) {
             return false;
         }
@@ -560,7 +606,7 @@ bool sync_parts(chsc6x_burn &burner, const UpdateImage &image, chsc6x_update_res
     if (report.boot.comparison == chsc6x_compare_status::different) {
         init.stage = "boot_write_verify";
         report.boot.write_attempted = true;
-        init.boot_written = burner.write_boot(image.boot, image.boot_size);
+        init.boot_written = burner.write_boot(image.boot, image.boot_size, report.boot);
         return init.boot_written;
     }
     return true;
@@ -576,17 +622,30 @@ chsc6x_update_result chsc6x_updater::run(chsc6x &touch, const uint8_t *package, 
 chsc6x_update_result chsc6x_updater::run(chsc6x &touch, const uint8_t *package, size_t length,
                                         const chsc6x_update_observer &observer)
 {
+    const chsc6x_update_package single = {package, length, nullptr};
     chsc6x_update_result report;
-    report.init = maintain(touch, package, length, report, observer);
+    report.init = maintain(touch, &single, 1, false, report, observer);
     return report;
 }
 
-chsc6x_init_result chsc6x_updater::maintain(chsc6x &touch, const uint8_t *package, size_t length,
-                                           chsc6x_update_result &report, const chsc6x_update_observer &observer)
+chsc6x_update_result chsc6x_updater::run_auto(chsc6x &touch, const chsc6x_update_package *packages, size_t count,
+                                              const chsc6x_update_observer &observer)
+{
+    chsc6x_update_result report;
+    report.init = maintain(touch, packages, count, true, report, observer);
+    return report;
+}
+
+chsc6x_init_result chsc6x_updater::maintain(chsc6x &touch, const chsc6x_update_package *packages, size_t count,
+                                           bool auto_select, chsc6x_update_result &report,
+                                           const chsc6x_update_observer &observer)
 {
     using probe = chsc6x::probe_state;
-    UpdateImage image;
-    if (!open_image(package, length, image)) {
+    bool valid = packages && count != 0;
+    for (size_t i = 0; valid && i < count; ++i) {
+        valid = valid_package(packages[i]);
+    }
+    if (!valid) {
         // Nothing touched the controller. Preserve any outstanding power-cycle requirement.
         chsc6x_init_result invalid;
         invalid.status = chsc6x_init_status::error;
@@ -595,7 +654,9 @@ chsc6x_init_result chsc6x_updater::maintain(chsc6x &touch, const uint8_t *packag
         invalid.touch_ready = touch.last_init_result().touch_ready;
         return invalid;
     }
-    report.target = image.versions;
+    if (!auto_select) {
+        report.target = image_contents(packages[0]).versions;
+    }
     bool hasReset, readFault;
     uint32_t identity;
     chsc6x::maintenance_probe evidence;
@@ -605,6 +666,11 @@ chsc6x_init_result chsc6x_updater::maintain(chsc6x &touch, const uint8_t *packag
     if (state == probe::blocked) {
         return init;
     }
+    if (state == probe::running) {
+        report.panel_identity = identity;
+        report.vendor_id = vendor_id(identity);
+        report.project_id = project_id(identity);
+    }
     if (readFault || state != probe::running) {
         report.cfg_reads_inconsistent = state == probe::cfg_inconsistent;
         report.running_data_invalid = state == probe::cfg_invalid || state == probe::boot_invalid ||
@@ -613,6 +679,26 @@ chsc6x_init_result chsc6x_updater::maintain(chsc6x &touch, const uint8_t *packag
                                  state == probe::cfg_unreadable || report.cfg_reads_inconsistent);
         return init;
     }
+    const chsc6x_update_package *selected = packages;
+    if (auto_select) {
+        size_t matches = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const uint32_t cfg = le32(packages[i].data + cfgOffset);
+            if (vendor_id(cfg) == report.vendor_id && project_id(cfg) == report.project_id) {
+                selected = &packages[i];
+                ++matches;
+            }
+        }
+        if (matches != 1) {
+            init.status = matches == 0 ? chsc6x_init_status::incompatible : chsc6x_init_status::error;
+            init.stage = matches == 0 ? "no_matching_package" : "ambiguous_package";
+            touch.restore_touch_mode(true);
+            return init;
+        }
+    }
+    const UpdateImage image = image_contents(*selected);
+    report.target = image.versions;
+    report.package_name = selected->name;
     if (!select_parts(identity, image, report)) {
         init.status = chsc6x_init_status::incompatible;
         init.stage = "panel_identity";

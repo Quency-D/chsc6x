@@ -12,6 +12,16 @@ struct chsc6x_part_result {
     // Offset within this component, valid only for a complete comparison.
     int32_t first_difference = -1;
     bool write_attempted = false;
+    const char *failure_step = nullptr;
+    // Valid when failure_step is set. Component-relative block start for I/O
+    // failures, exact byte for a mismatch or for the boot signature write.
+    uint16_t failure_offset = 0;
+};
+
+struct chsc6x_update_package {
+    const uint8_t *data;
+    size_t length;
+    const char *name; // Display label. If provided, it must outlive the returned result.
 };
 
 struct chsc6x_update_result {
@@ -25,6 +35,17 @@ struct chsc6x_update_result {
     bool cfg_reads_inconsistent = false;
     bool boot_reads_inconsistent = false;
     bool running_data_invalid = false;
+    int16_t vendor_id = -1;
+    int16_t project_id = -1;
+    const char *package_name = nullptr;
+    uint32_t panel_identity = 0;       // Low 26 bits of the validated running cfg.
+    uint32_t package_cfg_identity = 0; // Package values from the image used in select_parts.
+    uint32_t package_boot_match = 0;
+
+    bool boot_only() const {
+        return cfg.comparison == chsc6x_compare_status::not_applicable &&
+               boot.comparison != chsc6x_compare_status::not_applicable;
+    }
 };
 
 enum class chsc6x_update_part { cfg, boot };
@@ -45,8 +66,12 @@ public:
     static chsc6x_update_result run(chsc6x &touch, const uint8_t *package, size_t length);
     static chsc6x_update_result run(chsc6x &touch, const uint8_t *package, size_t length,
                                     const chsc6x_update_observer &observer);
+    // Select a unique package by the vendor/project IDs in the validated running cfg.
+    static chsc6x_update_result run_auto(chsc6x &touch, const chsc6x_update_package *packages, size_t count,
+                                         const chsc6x_update_observer &observer = {});
 
 private:
-    static chsc6x_init_result maintain(chsc6x &touch, const uint8_t *package, size_t length,
-                                      chsc6x_update_result &report, const chsc6x_update_observer &observer);
+    static chsc6x_init_result maintain(chsc6x &touch, const chsc6x_update_package *packages, size_t count,
+                                       bool auto_select, chsc6x_update_result &report,
+                                       const chsc6x_update_observer &observer);
 };

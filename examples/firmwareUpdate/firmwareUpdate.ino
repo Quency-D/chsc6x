@@ -1,8 +1,7 @@
 #include <chsc6x_update.h>
+#include <firmware/panel_packages.h>
 
 #if defined(WIFI_LORA_32_V4) && !defined(WIFI_LORA_32_V4_R8)
-#include <firmware/firmware_01_01_V224_V4.h>
-static constexpr auto &panelFirmware = fw_file_tlsc6x_01_01;
 constexpr int touchSda = 47;
 constexpr int touchScl = 48;
 constexpr int touchReset = 44;
@@ -10,8 +9,6 @@ constexpr int panelPower = 36;
 constexpr bool resetSharedWithTft = false;
 #else
 // V4R8 with TouchTFT V0.2. Adjust these defaults for other boards.
-#include <firmware/firmware_05_12_V224_V4.h>
-static constexpr auto &panelFirmware = fw_file_tlsc6x_05_12;
 constexpr int touchSda = 17;
 constexpr int touchScl = 18;
 constexpr int touchReset = 21;
@@ -57,6 +54,9 @@ static void printPart(const char *name, const chsc6x_part_result &part, bool wri
     if (part.write_attempted) {
         Serial.printf(", write/readback %s", written ? "verified" : "failed");
     }
+    if (part.failure_step) {
+        Serial.printf(", %s failed at +0x%04X", part.failure_step, unsigned(part.failure_offset));
+    }
     Serial.print("\r\n");
 }
 
@@ -79,8 +79,26 @@ void setup()
     }
 
     Serial.print("CHSC6X update may install an older firmware version.\r\n");
-    const auto result = chsc6x_updater::run(touch, panelFirmware, sizeof(panelFirmware));
+    const auto result = chsc6x_updater::run_auto(touch, chsc6x_firmware::packages, chsc6x_firmware::count);
     const auto &init = result.init;
+    if (result.vendor_id >= 0) {
+        Serial.printf("Panel VID/PID: %d/%d\r\n", result.vendor_id, result.project_id);
+    } else {
+        Serial.print("Panel VID/PID: unavailable\r\n");
+    }
+    Serial.printf("Selected package: %s%s\r\n", result.package_name ? result.package_name : "none",
+                  result.boot_only() ? " (boot only)" : "");
+    if (result.cfg.comparison == chsc6x_compare_status::not_applicable) {
+        Serial.printf("Panel identity: 0x%08lX, package cfg identity: 0x%08lX, package boot match: 0x%08lX\r\n",
+                      static_cast<unsigned long>(result.panel_identity),
+                      static_cast<unsigned long>(result.package_cfg_identity),
+                      static_cast<unsigned long>(result.package_boot_match));
+        Serial.print(result.boot_only() ? "Cfg identity mismatch. Skipping cfg.\r\n"
+                                        : "Neither cfg nor boot identity matches. Update skipped.\r\n");
+    } else if (result.vendor_id >= 0 && result.target.boot == 0) {
+        Serial.printf("Panel identity: 0x%08lX, package cfg identity: --, package boot match: --\r\n",
+                      static_cast<unsigned long>(result.panel_identity));
+    }
     printVersions("Old (controller before maintenance)", init.before, init.before_valid);
     printVersions("New (package target)", result.target, result.target.boot != 0);
     printPart("cfg", result.cfg, init.cfg_written);
