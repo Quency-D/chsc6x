@@ -81,19 +81,12 @@ void setup()
     Serial.print("CHSC6X update may install an older firmware version.\r\n");
     const auto result = chsc6x_updater::run_auto(touch, chsc6x_firmware::packages, chsc6x_firmware::count);
     const auto &init = result.init;
-    if (result.vendor_id >= 0) {
-        Serial.printf("Panel VID/PID: %d/%d\r\n", result.vendor_id, result.project_id);
-    } else {
-        Serial.print("Panel VID/PID: unavailable\r\n");
-    }
-    Serial.printf("Selected package: %s%s\r\n", result.package_name ? result.package_name : "none",
-                  result.boot_only() ? " (boot only)" : "");
     if (result.cfg.comparison == chsc6x_compare_status::not_applicable) {
         Serial.printf("Panel identity: 0x%08lX, package cfg identity: 0x%08lX, package boot match: 0x%08lX\r\n",
                       static_cast<unsigned long>(result.panel_identity),
                       static_cast<unsigned long>(result.package_cfg_identity),
                       static_cast<unsigned long>(result.package_boot_match));
-        Serial.print(result.boot_only() ? "Cfg identity mismatch. Skipping cfg.\r\n"
+        Serial.print(result.boot_only() ? "Cfg identity mismatch. Skipping cfg (boot only).\r\n"
                                         : "Neither cfg nor boot identity matches. Update skipped.\r\n");
     } else if (result.vendor_id >= 0 && result.target.boot == 0) {
         Serial.printf("Panel identity: 0x%08lX, package cfg identity: --, package boot match: --\r\n",

@@ -157,12 +157,6 @@ void setup()
         Serial.print("TFT result screen unavailable.\r\n");
     }
     const auto &init = result.init;
-    char line[48] = "VID/PID --  Pkg --";
-    if (result.vendor_id >= 0) {
-        snprintf(line, sizeof(line), "VID/PID %d/%d  Pkg %s", result.vendor_id, result.project_id,
-                 result.package_name ? result.package_name : "--");
-    }
-    resultLine(132, line, 1);
     if (result.cfg.comparison == chsc6x_compare_status::not_applicable) {
         showIdentity(142, "Panel ID", result.panel_identity);
         showIdentity(152, "Package cfg ID", result.package_cfg_identity);
@@ -184,6 +178,7 @@ void setup()
     resultLine(221, init.stage, 1);
     const auto &failed = result.cfg.failure_step ? result.cfg : result.boot;
     if (failed.failure_step) {
+        char line[48];
         snprintf(line, sizeof(line), "FAIL %s: %s +0x%04X", result.cfg.failure_step ? "cfg" : "boot",
                  failed.failure_step, unsigned(failed.failure_offset));
         resultLine(231, line, 1);
